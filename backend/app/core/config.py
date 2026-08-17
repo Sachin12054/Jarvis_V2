@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = Field(default="deepseek-r1-7b:latest", description="Default Ollama model")
     OLLAMA_CODING_MODEL: str = Field(default="qwen-coder-3b:latest", description="Ollama coding model")
     OLLAMA_FAST_MODEL: str = Field(default="gemma-3-4b:latest", description="Ollama fast model")
-    OLLAMA_TIMEOUT: float = Field(default=120.0, description="Ollama request timeout in seconds")
+    OLLAMA_TIMEOUT: float = Field(default=300.0, description="Ollama request timeout in seconds")
 
     # JARVIS Identity
     JARVIS_IDENTITY_NAME: str = "JARVIS"

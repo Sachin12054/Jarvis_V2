@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional
 from app.brain.context_manager import ContextManager
 from app.brain.llm_manager import LLMManager
+from app.brain.model_router import ModelRouter
 from app.core.config import settings
 from app.core.logging import logger
 
@@ -16,9 +17,11 @@ class JARVISOrchestrator:
         self,
         context_manager: Optional[ContextManager] = None,
         llm_manager: Optional[LLMManager] = None,
+        model_router: Optional[ModelRouter] = None,
     ):
         self.context_manager = context_manager or ContextManager()
         self.llm_manager = llm_manager or LLMManager()
+        self.model_router = model_router or ModelRouter()
 
     async def process_turn(
         self,
@@ -26,7 +29,7 @@ class JARVISOrchestrator:
         history: List[Dict[str, Any]],
         model: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Executes a single dialogue turn through context assembly and LLM reasoning."""
+        """Executes a single dialogue turn through context assembly, intelligent routing, and LLM reasoning."""
         logger.info("[JARVISOrchestrator] Processing turn...")
 
         # 1. Prepare formatted context including system prompt
@@ -40,12 +43,14 @@ class JARVISOrchestrator:
         # tool_plan = await self.tool_registry.plan_tools(formatted_messages)
         # if tool_plan: await self.permission_manager.check_and_execute(tool_plan)
 
-        # 3. Determine active model and generate response from LLM Provider
-        active_model = model or (
-            settings.OLLAMA_MODEL
-            if settings.LLM_PROVIDER == "ollama"
-            else settings.LLM_MODEL
-        )
+        # 3. Determine active model (Explicit caller override > ModelRouter > Settings default)
+        if model:
+            active_model = model
+        elif settings.LLM_PROVIDER == "ollama":
+            routing_result = self.model_router.route(user_message)
+            active_model = routing_result.model
+        else:
+            active_model = settings.LLM_MODEL
 
         response_text = await self.llm_manager.generate(
             messages=formatted_messages,
