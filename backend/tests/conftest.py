@@ -12,6 +12,8 @@ from app.database.base import Base
 from app.database.session import get_db
 from app.main import app
 
+from app.core.config import settings
+
 # In-memory SQLite test engine
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -26,6 +28,12 @@ TestingSessionLocal = async_sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+@pytest.fixture(autouse=True)
+def default_mock_llm_provider(monkeypatch):
+    """Ensures test suite defaults to mock LLM provider unless overridden."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "mock")
 
 
 @pytest_asyncio.fixture(scope="function")

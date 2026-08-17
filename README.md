@@ -107,7 +107,66 @@ LLM_TIMEOUT=30
 
 ---
 
-## 5. Running JARVIS Locally
+## 5. Local Ollama LLM Integration
+
+JARVIS supports fully local, private LLM execution using **Ollama**.
+
+### Step 1: Install & Start Ollama
+Ensure Ollama is installed on your machine and the background service is running.
+
+### Step 2: Verify Installed Local Models
+List installed models:
+```powershell
+ollama list
+```
+Confirm the following models are installed:
+- `deepseek-r1-7b:latest` (Default reasoning model)
+- `qwen-coder-3b:latest` (Coding model)
+- `gemma-3-4b:latest` (Fast/general model)
+
+### Step 3: Verify Ollama Local HTTP API
+Check server tags:
+```powershell
+curl http://127.0.0.1:11434/api/tags
+```
+
+### Step 4: Test Model Directly
+Test model execution via terminal:
+```powershell
+ollama run deepseek-r1-7b:latest
+```
+
+### Step 5: Configure JARVIS for Ollama
+In `.env`:
+```env
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=deepseek-r1-7b:latest
+OLLAMA_CODING_MODEL=qwen-coder-3b:latest
+OLLAMA_FAST_MODEL=gemma-3-4b:latest
+OLLAMA_TIMEOUT=120
+```
+*Note: Ollama runs 100% locally and does not require an OpenAI or Gemini API key.*
+
+### Step 6: Start JARVIS Backend & Test Chat Endpoint
+Start the server:
+```powershell
+cd backend
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+Send a request to the chat API:
+```http
+POST http://127.0.0.1:8000/api/v1/chat
+Content-Type: application/json
+
+{
+  "message": "Hello JARVIS"
+}
+```
+
+---
+
+## 6. Running JARVIS Locally
 
 ### Running Directly via Uvicorn (No Docker Required)
 You can run the server directly using Uvicorn:

@@ -128,6 +128,53 @@ class GeminiLLMProvider(LLMProvider):
             raise LLMProviderError("gemini", f"Network request error: {str(exc)}")
 
 
+class OllamaLLMProvider(LLMProvider):
+    """Local Ollama LLM provider via async HTTP API."""
+
+    def __init__(self, base_url: Optional[str] = None):
+        self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
+        self.endpoint = f"{self.base_url}/api/chat"
+
+    async def generate_response(
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        selected_model = model or settings.OLLAMA_MODEL
+        req_timeout = timeout or settings.OLLAMA_TIMEOUT
+
+        payload = {
+            "model": selected_model,
+            "messages": messages,
+            "stream": False,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=req_timeout) as client:
+                response = await client.post(self.endpoint, json=payload)
+                
+                if response.status_code == 404:
+                    raise LLMProviderError("ollama", f"Model '{selected_model}' not found on Ollama server.")
+                elif response.status_code != 200:
+                    raise LLMProviderError("ollama", f"HTTP {response.status_code}: {response.text}")
+                
+                try:
+                    data = response.json()
+                    return data["message"]["content"]
+                except (KeyError, TypeError) as exc:
+                    raise LLMProviderError("ollama", f"Malformed response structure from Ollama API: {str(exc)}")
+
+        except httpx.TimeoutException:
+            raise LLMTimeoutError("ollama")
+        except LLMProviderError:
+            raise
+        except httpx.RequestError as exc:
+            raise LLMProviderError(
+                "ollama", f"Ollama server is unavailable at {self.base_url}: {str(exc)}"
+            )
+
+
 class LLMManager:
     """Factory and router for LLM Provider instances."""
 
@@ -135,6 +182,7 @@ class LLMManager:
         "mock": MockLLMProvider,
         "openai": OpenAILLMProvider,
         "gemini": GeminiLLMProvider,
+        "ollama": OllamaLLMProvider,
     }
 
     def __init__(self, provider_name: Optional[str] = None):

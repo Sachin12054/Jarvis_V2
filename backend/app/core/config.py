@@ -21,10 +21,17 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://jarvis_user:jarvis_password@localhost:5432/jarvis_db"
 
     # LLM Settings
-    LLM_PROVIDER: str = Field(default="mock", description="Provider: mock, openai, gemini")
+    LLM_PROVIDER: str = Field(default="ollama", description="Provider: mock, openai, gemini, ollama")
     LLM_API_KEY: Optional[str] = Field(default=None, description="API Key for the chosen provider")
-    LLM_MODEL: str = Field(default="gpt-4o-mini", description="Model identifier")
+    LLM_MODEL: str = Field(default="deepseek-r1-7b:latest", description="Model identifier")
     LLM_TIMEOUT: float = Field(default=30.0, description="Timeout in seconds for LLM calls")
+
+    # Ollama Local Settings
+    OLLAMA_BASE_URL: str = Field(default="http://127.0.0.1:11434", description="Ollama local HTTP API base URL")
+    OLLAMA_MODEL: str = Field(default="deepseek-r1-7b:latest", description="Default Ollama model")
+    OLLAMA_CODING_MODEL: str = Field(default="qwen-coder-3b:latest", description="Ollama coding model")
+    OLLAMA_FAST_MODEL: str = Field(default="gemma-3-4b:latest", description="Ollama fast model")
+    OLLAMA_TIMEOUT: float = Field(default=120.0, description="Ollama request timeout in seconds")
 
     # JARVIS Identity
     JARVIS_IDENTITY_NAME: str = "JARVIS"

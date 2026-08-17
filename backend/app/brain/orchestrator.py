@@ -40,13 +40,18 @@ class JARVISOrchestrator:
         # tool_plan = await self.tool_registry.plan_tools(formatted_messages)
         # if tool_plan: await self.permission_manager.check_and_execute(tool_plan)
 
-        # 3. Generate response from LLM Provider
-        response_text = await self.llm_manager.generate(
-            messages=formatted_messages,
-            model=model or settings.LLM_MODEL,
+        # 3. Determine active model and generate response from LLM Provider
+        active_model = model or (
+            settings.OLLAMA_MODEL
+            if settings.LLM_PROVIDER == "ollama"
+            else settings.LLM_MODEL
         )
 
-        active_model = model or settings.LLM_MODEL
+        response_text = await self.llm_manager.generate(
+            messages=formatted_messages,
+            model=active_model,
+        )
+
         logger.info(f"[JARVISOrchestrator] Response generated via model '{active_model}'.")
 
         return {
