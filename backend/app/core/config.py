@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = Field(default="ollama", description="Provider: mock, openai, gemini, ollama")
     LLM_API_KEY: Optional[str] = Field(default=None, description="API Key for the chosen provider")
     LLM_MODEL: str = Field(default="qwen3-test:latest", description="Model identifier")
-    LLM_TIMEOUT: float = Field(default=60.0, description="Timeout in seconds for LLM calls")
+    LLM_TIMEOUT: float = Field(default=180.0, description="Timeout in seconds for LLM calls")
 
     # Local Whisper Speech-to-Text (STT) Settings
     JARVIS_STT_PROVIDER: str = Field(default="local_whisper", description="STT Provider: local_whisper")
@@ -71,9 +71,9 @@ class Settings(BaseSettings):
     OLLAMA_CONTEXT_LENGTH: int = Field(default=16384, description="Context window size in tokens")
     OLLAMA_CODING_MODEL: str = Field(default="qwen-coder-3b:latest", description="Ollama coding model")
     OLLAMA_FAST_MODEL: str = Field(default="gemma-3-4b:latest", description="Ollama fast model")
-    OLLAMA_TIMEOUT: float = Field(default=300.0, description="Ollama overall timeout in seconds")
-    OLLAMA_CONNECT_TIMEOUT: float = Field(default=5.0, description="Ollama HTTP connection timeout in seconds")
-    OLLAMA_READ_TIMEOUT: float = Field(default=120.0, description="Ollama HTTP read timeout in seconds")
+    OLLAMA_TIMEOUT: float = Field(default=180.0, description="Ollama overall timeout in seconds")
+    OLLAMA_CONNECT_TIMEOUT: float = Field(default=10.0, description="Ollama HTTP connection timeout in seconds")
+    OLLAMA_READ_TIMEOUT: float = Field(default=180.0, description="Ollama HTTP read timeout in seconds")
 
     # JARVIS Identity
     JARVIS_IDENTITY_NAME: str = "JARVIS"

@@ -1,15 +1,18 @@
 import time
-import subprocess
-import psutil
+import asyncio
 from typing import Dict, Any, Optional
+from app.execution.cua_driver_client import CuaDriverClient
 from app.core.logging import logger
 
 
 class ActiveWindowService:
-    """Active Window Detection Service: Inspects active foreground window title, process, executable, and bounding box."""
+    """Active Window Perception Service: Queries current active foreground window details via CUA Driver."""
+
+    def __init__(self):
+        self.cua_client = CuaDriverClient.get_instance()
 
     def get_active_window(self) -> Dict[str, Any]:
-        """Queries current active foreground window details on Windows OS."""
+        """Queries current active foreground window details via CUA Driver state."""
         timestamp = time.time()
         title = "Desktop"
         process_name = "explorer.exe"
@@ -17,28 +20,26 @@ class ActiveWindowService:
         bounds = {"x": 0, "y": 0, "width": 1920, "height": 1080}
 
         try:
-            cmd = "powershell -Command \"$code = '[DllImport(\\\"user32.dll\\\")] public static extern IntPtr GetForegroundWindow(); [DllImport(\\\"user32.dll\\\")] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count); [DllImport(\\\"user32.dll\\\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);'; $type = Add-Type -MemberDefinition $code -Name WinAPI -PassThru; $hwnd = $type::GetForegroundWindow(); $sb = New-Object System.Text.StringBuilder 256; $null = $type::GetWindowText($hwnd, $sb, 256); $pid = 0; $null = $type::GetWindowThreadProcessId($hwnd, [ref]$pid); $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue; @{Title=$sb.ToString(); Process=$proc.ProcessName; Path=$proc.Path} | ConvertTo-Json\""
-            out = subprocess.check_output(cmd, shell=True, timeout=3).decode().strip()
-            if out:
-                import json
-                data = json.loads(out)
-                title = data.get("Title") or title
-                process_name = data.get("Process") or process_name
-                executable = data.get("Path") or executable
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    res = pool.submit(asyncio.run, self.cua_client.list_windows()).result(timeout=3.0)
+            else:
+                res = asyncio.run(self.cua_client.list_windows())
+
+            if res.get("success"):
+                data = res.get("data", {})
+                windows = data.get("windows", []) or data.get("_legacy_windows", [])
+                if windows:
+                    # Top window in windows list (z_index highest)
+                    top = windows[0]
+                    title = top.get("title") or title
+                    process_name = top.get("app_name") or process_name
+                    bounds = top.get("bounds") or bounds
 
         except Exception as err:
-            logger.warning(f"[ACTIVE WINDOW] PowerShell Win32 API query warning: {err}")
-            # Fallback to psutil process inspection
-            for proc in psutil.process_iter(['name', 'exe']):
-                try:
-                    name = proc.info['name'].lower()
-                    if name in ["code.exe", "powershell.exe", "chrome.exe", "bash.exe", "cmd.exe"]:
-                        process_name = proc.info['name']
-                        executable = proc.info['exe'] or executable
-                        title = process_name.replace(".exe", "").title()
-                        break
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+            logger.warning(f"[ACTIVE WINDOW] CUA Driver query warning: {err}")
 
         res = {
             "title": title,

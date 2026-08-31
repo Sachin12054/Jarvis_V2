@@ -1,4 +1,6 @@
 import json
+import time
+import asyncio
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import httpx
@@ -151,7 +153,15 @@ class GeminiLLMProvider(LLMProvider):
 
 
 class OllamaLLMProvider(LLMProvider):
-    """Local Ollama LLM provider via async HTTP API with explicit timeouts."""
+    """Local Ollama LLM provider via async HTTP API with explicit timeouts, model locks, and timing diagnostics."""
+
+    _model_lock: Optional[asyncio.Lock] = None
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        if cls._model_lock is None:
+            cls._model_lock = asyncio.Lock()
+        return cls._model_lock
 
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
@@ -173,6 +183,7 @@ class OllamaLLMProvider(LLMProvider):
         timeout: Optional[float] = None,
     ) -> str:
         selected_model = model or settings.OLLAMA_MODEL
+        num_ctx = getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
         req_timeout = self._get_httpx_timeout(timeout)
 
         payload = {
@@ -180,33 +191,48 @@ class OllamaLLMProvider(LLMProvider):
             "messages": messages,
             "stream": False,
             "options": {
-                "num_ctx": getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
+                "num_ctx": num_ctx
             },
+            "keep_alive": "15m",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=req_timeout) as client:
-                response = await client.post(self.endpoint, json=payload)
+        t_start = time.time()
+        logger.info(f"[OLLAMA LLM START] model='{selected_model}' num_ctx={num_ctx} endpoint='{self.endpoint}' timeout_cfg={req_timeout}")
 
-                if response.status_code == 404:
-                    raise LLMProviderError("ollama", f"Model '{selected_model}' not found on Ollama server.")
-                elif response.status_code != 200:
-                    raise LLMProviderError("ollama", f"HTTP {response.status_code}: {response.text}")
+        async with self._get_lock():
+            try:
+                async with httpx.AsyncClient(timeout=req_timeout) as client:
+                    response = await client.post(self.endpoint, json=payload)
+                    t_total = (time.time() - t_start) * 1000.0
 
-                try:
-                    data = response.json()
-                    return data["message"]["content"]
-                except (KeyError, TypeError) as exc:
-                    raise LLMProviderError("ollama", f"Malformed response structure from Ollama API: {str(exc)}")
+                    if response.status_code == 404:
+                        logger.error(f"[OLLAMA LLM ERROR] Model '{selected_model}' not found. duration_ms={t_total:.1f}ms")
+                        raise LLMProviderError("ollama", f"Model '{selected_model}' not found on Ollama server.")
+                    elif response.status_code != 200:
+                        logger.error(f"[OLLAMA LLM ERROR] HTTP {response.status_code}: {response.text} duration_ms={t_total:.1f}ms")
+                        raise LLMProviderError("ollama", f"HTTP {response.status_code}: {response.text}")
 
-        except httpx.TimeoutException:
-            raise LLMTimeoutError("ollama")
-        except LLMProviderError:
-            raise
-        except httpx.RequestError as exc:
-            raise LLMProviderError(
-                "ollama", f"Ollama server is unavailable at {self.base_url}: {str(exc)}"
-            )
+                    try:
+                        data = response.json()
+                        content = data["message"]["content"]
+                        eval_count = data.get("eval_count", 0)
+                        logger.info(f"[OLLAMA LLM SUCCESS] model='{selected_model}' num_ctx={num_ctx} total_ms={t_total:.1f}ms eval_tokens={eval_count}")
+                        return content
+                    except (KeyError, TypeError) as exc:
+                        raise LLMProviderError("ollama", f"Malformed response structure from Ollama API: {str(exc)}")
+
+            except httpx.TimeoutException as exc:
+                t_duration = time.time() - t_start
+                logger.error(f"[OLLAMA LLM TIMEOUT] model='{selected_model}' num_ctx={num_ctx} duration_s={t_duration:.2f}s error='{type(exc).__name__}: {str(exc)}'")
+                raise LLMTimeoutError("ollama")
+            except LLMProviderError:
+                raise
+            except httpx.RequestError as exc:
+                t_duration = time.time() - t_start
+                logger.error(f"[OLLAMA LLM REQUEST ERROR] model='{selected_model}' duration_s={t_duration:.2f}s error='{type(exc).__name__}: {str(exc)}'")
+                raise LLMProviderError(
+                    "ollama", f"Ollama server is unavailable at {self.base_url}: {str(exc)}"
+                )
 
     async def generate_response_stream(
         self,
@@ -215,6 +241,7 @@ class OllamaLLMProvider(LLMProvider):
         timeout: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         selected_model = model or settings.OLLAMA_MODEL
+        num_ctx = getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
         req_timeout = self._get_httpx_timeout(timeout)
 
         payload = {
@@ -222,58 +249,67 @@ class OllamaLLMProvider(LLMProvider):
             "messages": messages,
             "stream": True,
             "options": {
-                "num_ctx": getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
+                "num_ctx": num_ctx
             },
-            "keep_alive": "10m",
+            "keep_alive": "15m",
         }
 
-        logger.info(f"[OllamaStream] Starting model={selected_model}")
+        t_start = time.time()
+        logger.info(f"[OLLAMA STREAM START] model='{selected_model}' num_ctx={num_ctx}")
         first_chunk_logged = False
+        ttft_ms = 0.0
         chunk_count = 0
         char_count = 0
 
-        try:
-            async with httpx.AsyncClient(timeout=req_timeout) as client:
-                async with client.stream("POST", self.endpoint, json=payload) as response:
-                    if response.status_code == 404:
-                        raise LLMProviderError("ollama", f"Model '{selected_model}' not found on Ollama server.")
-                    elif response.status_code != 200:
-                        content = await response.aread()
-                        raise LLMProviderError("ollama", f"HTTP {response.status_code}: {content.decode()}")
+        async with self._get_lock():
+            try:
+                async with httpx.AsyncClient(timeout=req_timeout) as client:
+                    async with client.stream("POST", self.endpoint, json=payload) as response:
+                        if response.status_code == 404:
+                            raise LLMProviderError("ollama", f"Model '{selected_model}' not found on Ollama server.")
+                        elif response.status_code != 200:
+                            content = await response.aread()
+                            raise LLMProviderError("ollama", f"HTTP {response.status_code}: {content.decode()}")
 
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
 
-                        msg_data = data.get("message", {})
-                        chunk = msg_data.get("content") or data.get("thinking") or msg_data.get("thinking") or ""
+                            msg_data = data.get("message", {})
+                            chunk = msg_data.get("content") or data.get("thinking") or msg_data.get("thinking") or ""
 
-                        if chunk:
-                            if not first_chunk_logged:
-                                logger.info("[OllamaStream] First chunk received")
-                                first_chunk_logged = True
-                            chunk_count += 1
-                            char_count += len(chunk)
-                            yield chunk
+                            if chunk:
+                                if not first_chunk_logged:
+                                    ttft_ms = (time.time() - t_start) * 1000.0
+                                    logger.info(f"[OLLAMA STREAM TTFT] First chunk received in {ttft_ms:.1f}ms")
+                                    first_chunk_logged = True
+                                chunk_count += 1
+                                char_count += len(chunk)
+                                yield chunk
 
-                        if data.get("done", False):
-                            break
+                            if data.get("done", False):
+                                break
 
-            logger.info(f"[OllamaStream] Stream completed chunks={chunk_count} characters={char_count}")
+                t_total = (time.time() - t_start) * 1000.0
+                logger.info(f"[OLLAMA STREAM SUCCESS] chunks={chunk_count} chars={char_count} ttft_ms={ttft_ms:.1f}ms total_ms={t_total:.1f}ms")
 
-        except httpx.TimeoutException:
-            raise LLMTimeoutError("ollama")
-        except LLMProviderError:
-            raise
-        except httpx.RequestError as exc:
-            raise LLMProviderError(
-                "ollama", f"Ollama server is unavailable at {self.base_url}: {str(exc)}"
-            )
+            except httpx.TimeoutException as exc:
+                t_duration = time.time() - t_start
+                logger.error(f"[OLLAMA STREAM TIMEOUT] model='{selected_model}' num_ctx={num_ctx} duration_s={t_duration:.2f}s error='{type(exc).__name__}: {str(exc)}'")
+                raise LLMTimeoutError("ollama")
+            except LLMProviderError:
+                raise
+            except httpx.RequestError as exc:
+                t_duration = time.time() - t_start
+                logger.error(f"[OLLAMA STREAM REQUEST ERROR] duration_s={t_duration:.2f}s error='{type(exc).__name__}: {str(exc)}'")
+                raise LLMProviderError(
+                    "ollama", f"Ollama server is unavailable at {self.base_url}: {str(exc)}"
+                )
 
 
 class LLMManager:
