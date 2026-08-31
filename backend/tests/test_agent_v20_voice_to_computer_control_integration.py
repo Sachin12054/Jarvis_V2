@@ -6,6 +6,16 @@ from app.cognition.command_router import CommandRouter
 
 
 @pytest.mark.asyncio
+async def test_voice_open_notepad_fastpath(db_session: AsyncSession):
+    """Verifies 'Open Notepad' maps directly to focus_window('Notepad') on computer gateway without AttributeError."""
+    chat_service = ChatService()
+    res = await chat_service.handle_chat_request(db_session, "Open Notepad", channel="voice")
+
+    assert res["message"] in ["Notepad is open.", "Couldn't open Notepad."]
+    assert res["model"] == "jarvis-command-router"
+
+
+@pytest.mark.asyncio
 async def test_voice_open_chrome_fastpath(db_session: AsyncSession):
     """Verifies 'Open Chrome' maps directly to focus_window('Chrome') on computer gateway."""
     chat_service = ChatService()

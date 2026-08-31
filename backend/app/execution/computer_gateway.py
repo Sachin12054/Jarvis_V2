@@ -85,6 +85,15 @@ class ComputerUseGateway:
             error=res.get("error"),
         )
 
+    async def focus_window(self, app_name_or_title: str) -> ActionResult:
+        """Resolves and focuses target window if open, or launches app if not running via CUA Driver."""
+        res = await self.resolve_window(app_name=app_name_or_title, title_contains=app_name_or_title, timeout=2.0)
+        if res.executed and res.evidence.get("window_id"):
+            win_id = res.evidence["window_id"]
+            return await self.bring_to_front(win_id)
+        # If absent, launch app via CUA Driver
+        return await self.launch_app(app_name_or_title)
+
     async def launch_app(self, app_name: str) -> ActionResult:
         """Launches target application via CUA Driver and resolves live window target."""
         res = await self.cua_client.launch_app(app_name)
@@ -214,3 +223,47 @@ class ComputerUseGateway:
             evidence=res.get("data", {}),
             error=res.get("error"),
         )
+
+    async def browser_close_tab(self) -> ActionResult:
+        """Closes active browser tab via CUA Driver hotkey Ctrl+W."""
+        return await self.hotkey(["ctrl", "w"])
+
+    async def browser_new_tab(self) -> ActionResult:
+        """Opens new browser tab via CUA Driver hotkey Ctrl+T."""
+        return await self.hotkey(["ctrl", "t"])
+
+    async def browser_back(self) -> ActionResult:
+        """Navigates back via CUA Driver hotkey Alt+Left."""
+        return await self.hotkey(["alt", "left"])
+
+    async def pause_video(self) -> ActionResult:
+        """Toggles video pause via CUA Driver key 'space'."""
+        return await self.press_key("space")
+
+    async def resume_video(self) -> ActionResult:
+        """Toggles video resume via CUA Driver key 'space'."""
+        return await self.press_key("space")
+
+    async def execute_gesture_action(self, action_name: str) -> ActionResult:
+        """Executes gesture computer action via CUA Driver."""
+        act = action_name.upper()
+        if act == "SCROLL_DOWN":
+            return await self.press_key("pagedown")
+        elif act == "SCROLL_UP":
+            return await self.press_key("pageup")
+        elif act == "LEFT_CLICK":
+            return await self.press_key("space")
+        elif act == "RIGHT_CLICK":
+            return await self.press_key("apps")
+        elif act == "DOUBLE_CLICK":
+            return await self.press_key("enter")
+        return ActionResult(
+            requested_action=f"gesture:{action_name}",
+            executed=False,
+            verified=False,
+            error=f"Unknown gesture action: {action_name}",
+        )
+
+    async def select_result(self, index: int) -> ActionResult:
+        """Selects result index via CUA Driver key press."""
+        return await self.press_key(str(index))

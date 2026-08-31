@@ -56,7 +56,7 @@ class CommandRouter:
         # Priority 1: Direct Physical Application Launch & Focus Commands
         if re.search(r'\b(?:open|launch|start|bring\s+up|get)\s+(?:my\s+)?chrome\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_chrome' clean='{clean}'")
-            res = gateway.focus_window("Chrome")
+            res = await gateway.focus_window("Chrome")
             reply = "Chrome is open." if res.verified else "Couldn't open Chrome."
             return RoutedCommand(
                 is_routed=True,
@@ -68,7 +68,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:open|launch|start|switch\s+to)\s+(?:vs\s*code|code)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_vscode' clean='{clean}'")
-            res = gateway.focus_window("VS Code")
+            res = await gateway.focus_window("VS Code")
             reply = "VS Code is open." if res.verified else "Couldn't open VS Code."
             return RoutedCommand(
                 is_routed=True,
@@ -80,7 +80,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:open|launch|start)\s+notepad\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_notepad' clean='{clean}'")
-            res = gateway.focus_window("Notepad")
+            res = await gateway.focus_window("Notepad")
             reply = "Notepad is open." if res.verified else "Couldn't open Notepad."
             return RoutedCommand(
                 is_routed=True,
@@ -92,7 +92,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:open|launch|start|get)\s+youtube\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_youtube' clean='{clean}'")
-            res = gateway.focus_window("YouTube")
+            res = await gateway.focus_window("YouTube")
             reply = "YouTube is ready." if res.verified else "Couldn't open YouTube."
             return RoutedCommand(
                 is_routed=True,
@@ -105,7 +105,7 @@ class CommandRouter:
         # Priority 1: Direct Physical Tab / Window / Media Commands
         if re.search(r'\b(?:close\s+the\s+tab|close\s+this\s+tab|close\s+tab|get\s+rid\s+of\s+this\s+tab)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='close_tab' clean='{clean}'")
-            res = gateway.browser_close_tab()
+            res = await gateway.browser_close_tab()
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -116,7 +116,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:new\s+tab|open\s+another\s+tab|create\s+tab)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='new_tab' clean='{clean}'")
-            res = gateway.browser_new_tab()
+            res = await gateway.browser_new_tab()
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -127,7 +127,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:go\s+back|previous\s+page|take\s+me\s+back|back)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='browser_back' clean='{clean}'")
-            res = gateway.browser_back()
+            res = await gateway.browser_back()
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -138,7 +138,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:scroll\s+down|scroll\s+a\s+little\s+down)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='scroll_down' clean='{clean}'")
-            res = gateway.execute_gesture_action("SCROLL_DOWN")
+            res = await gateway.execute_gesture_action("SCROLL_DOWN")
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -149,7 +149,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:scroll\s+up|scroll\s+a\s+little\s+up)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='scroll_up' clean='{clean}'")
-            res = gateway.execute_gesture_action("SCROLL_UP")
+            res = await gateway.execute_gesture_action("SCROLL_UP")
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -160,7 +160,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:pause|pause\s+it|pause\s+video|freeze)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='pause_video' clean='{clean}'")
-            res = gateway.pause_video()
+            res = await gateway.pause_video()
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -171,7 +171,7 @@ class CommandRouter:
 
         if re.search(r'\b(?:resume|unpause|continue\s+playing|play\s+it)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='resume_video' clean='{clean}'")
-            res = gateway.resume_video()
+            res = await gateway.resume_video()
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -182,7 +182,7 @@ class CommandRouter:
 
         if clean in ["click", "left click", "click here", "press this"]:
             logger.info(f"[ROUTER] Priority 1 matched: command_type='click' clean='{clean}'")
-            res = gateway.execute_gesture_action("LEFT_CLICK")
+            res = await gateway.execute_gesture_action("LEFT_CLICK")
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -193,7 +193,7 @@ class CommandRouter:
 
         if clean in ["right click", "context menu"]:
             logger.info(f"[ROUTER] Priority 1 matched: command_type='right_click' clean='{clean}'")
-            res = gateway.execute_gesture_action("RIGHT_CLICK")
+            res = await gateway.execute_gesture_action("RIGHT_CLICK")
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
@@ -204,7 +204,7 @@ class CommandRouter:
 
         if clean in ["double click"]:
             logger.info(f"[ROUTER] Priority 1 matched: command_type='double_click' clean='{clean}'")
-            res = gateway.execute_gesture_action("DOUBLE_CLICK")
+            res = await gateway.execute_gesture_action("DOUBLE_CLICK")
             return RoutedCommand(
                 is_routed=True,
                 priority=1,
