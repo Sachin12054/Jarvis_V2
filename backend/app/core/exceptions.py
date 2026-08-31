@@ -17,6 +17,16 @@ class ConversationNotFoundError(JarvisException):
         )
 
 
+class MemoryNotFoundError(JarvisException):
+    """Raised when a requested memory does not exist."""
+
+    def __init__(self, memory_id: str):
+        super().__init__(
+            message=f"Memory with ID '{memory_id}' was not found.",
+            status_code=404,
+        )
+
+
 class LLMProviderError(JarvisException):
     """Raised when an LLM provider encounters an unrecoverable failure."""
 

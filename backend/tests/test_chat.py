@@ -49,3 +49,27 @@ async def test_chat_empty_message_returns_422(async_client: AsyncClient):
     payload = {"message": ""}
     response = await async_client.post("/api/v1/chat", json=payload)
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_endpoint(async_client: AsyncClient):
+    """Verifies POST /api/v1/chat/stream streams Server-Sent Events text chunks."""
+    payload = {"message": "Hello JARVIS"}
+    response = await async_client.post("/api/v1/chat/stream", json=payload)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    content = response.text
+    assert "data: {" in content
+    assert '"done": true' in content or '"done":true' in content
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_parameter(async_client: AsyncClient):
+    """Verifies POST /api/v1/chat with stream=True streams Server-Sent Events text chunks."""
+    payload = {"message": "Hello JARVIS", "stream": True}
+    response = await async_client.post("/api/v1/chat", json=payload)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    content = response.text
+    assert "data: {" in content
+    assert '"done": true' in content or '"done":true' in content

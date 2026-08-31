@@ -9,10 +9,21 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional existing conversation UUID to continue a session",
     )
+    stream: bool = Field(
+        default=False,
+        description="Whether to stream response tokens via Server-Sent Events",
+    )
 
 
 class ChatResponse(BaseModel):
     """Schema for chat API response payload."""
     conversation_id: str = Field(..., description="Unique conversation session UUID")
     message: str = Field(..., description="JARVIS assistant response text")
+    model: str = Field(..., description="Model used to generate the response")
+
+
+class ChatStreamChunk(BaseModel):
+    """Schema for individual streaming text chunks."""
+    conversation_id: str = Field(..., description="Unique conversation session UUID")
+    chunk: str = Field(..., description="Incremental response text token chunk")
     model: str = Field(..., description="Model used to generate the response")

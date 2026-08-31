@@ -40,7 +40,7 @@ async def test_llm_manager_fallback():
 
 # --- OllamaLLMProvider Unit Tests (HTTP Mocked) ---
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
 from app.brain.llm_manager import OllamaLLMProvider
 from app.core.exceptions import LLMTimeoutError
@@ -145,4 +145,38 @@ async def test_ollama_provider_explicit_model_selection():
         res = await provider.generate_response(messages, model="qwen-coder-3b:latest")
         assert res == "Code response"
         assert mock_post.call_args.kwargs["json"]["model"] == "qwen-coder-3b:latest"
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_stream_success():
+    """Verifies OllamaLLMProvider.generate_response_stream yields incremental JSON line tokens."""
+    provider = OllamaLLMProvider(base_url="http://127.0.0.1:11434")
+    messages = [{"role": "user", "content": "Hello"}]
+
+    lines = [
+        b'{"message":{"role":"assistant","content":"Hello"},"done":false}\n',
+        b'{"message":{"role":"assistant","content":" world"},"done":false}\n',
+        b'{"done":true}\n',
+    ]
+
+    async def mock_aiter_lines():
+        for line in lines:
+            yield line.decode("utf-8")
+
+    mock_stream_resp = MagicMock()
+    mock_stream_resp.status_code = 200
+    mock_stream_resp.aiter_lines = mock_aiter_lines
+
+    class MockStreamContext:
+        async def __aenter__(self):
+            return mock_stream_resp
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("httpx.AsyncClient.stream", return_value=MockStreamContext()):
+        chunks = []
+        async for chunk in provider.generate_response_stream(messages):
+            chunks.append(chunk)
+
+        assert chunks == ["Hello", " world"]
 

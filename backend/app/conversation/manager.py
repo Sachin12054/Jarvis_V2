@@ -1,13 +1,15 @@
 from typing import List, Optional, Dict, Any
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import ConversationNotFoundError
+from app.database.base import utc_now
 from app.database.models.conversation import Conversation
 from app.database.models.message import Message
 
 
 class ConversationManager:
-    """Manages creation, retrieval, and message storage for chat sessions."""
+    """Manages creation, retrieval, listing, deletion, and message storage for chat sessions."""
 
     async def create_conversation(self, db: AsyncSession, status: str = "active") -> Conversation:
         """Creates and persists a new conversation session."""
@@ -18,7 +20,7 @@ class ConversationManager:
         return conversation
 
     async def get_conversation(self, db: AsyncSession, conversation_id: str) -> Optional[Conversation]:
-        """Retrieves a conversation by ID."""
+        """Retrieves a conversation metadata by ID."""
         stmt = select(Conversation).where(Conversation.id == conversation_id)
         result = await db.execute(stmt)
         return result.scalar_one_or_none()
@@ -34,6 +36,40 @@ class ConversationManager:
             return conversation
         return await self.create_conversation(db)
 
+    async def list_conversations(
+        self, db: AsyncSession, limit: int = 50, offset: int = 0
+    ) -> List[Conversation]:
+        """Retrieves conversation sessions ordered by updated_at descending (newest first)."""
+        stmt = (
+            select(Conversation)
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_conversation_detail(
+        self, db: AsyncSession, conversation_id: str
+    ) -> Optional[Conversation]:
+        """Retrieves conversation by ID with eager-loaded messages ordered chronologically."""
+        stmt = (
+            select(Conversation)
+            .where(Conversation.id == conversation_id)
+            .options(selectinload(Conversation.messages))
+        )
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def delete_conversation(self, db: AsyncSession, conversation_id: str) -> bool:
+        """Safely deletes a conversation and its associated messages. Returns True if deleted, False if not found."""
+        conversation = await self.get_conversation(db, conversation_id)
+        if not conversation:
+            return False
+        await db.delete(conversation)
+        await db.flush()
+        return True
+
     async def add_message(
         self,
         db: AsyncSession,
@@ -42,7 +78,7 @@ class ConversationManager:
         content: str,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Message:
-        """Adds and persists a new message to a conversation."""
+        """Adds and persists a new message to a conversation and touches updated_at timestamp."""
         message = Message(
             conversation_id=conversation_id,
             role=role,
@@ -50,6 +86,11 @@ class ConversationManager:
             extra_metadata=extra_metadata or {},
         )
         db.add(message)
+
+        conversation = await self.get_conversation(db, conversation_id)
+        if conversation:
+            conversation.updated_at = utc_now()
+
         await db.flush()
         await db.refresh(message)
         return message
