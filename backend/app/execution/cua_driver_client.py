@@ -3,9 +3,68 @@ import sys
 import json
 import time
 import asyncio
+import subprocess
 from typing import Dict, Any, Optional, List
 from app.core.config import settings
 from app.core.logging import logger
+
+
+def _run_subprocess_sync(cmd: List[str], input_bytes: Optional[bytes], timeout: float) -> Dict[str, Any]:
+    """Executes a synchronous subprocess with timeout, returning raw byte streams and return codes."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = proc.communicate(input=input_bytes, timeout=timeout)
+        return {
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": None,
+            "timeout": False,
+        }
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        except Exception:
+            stdout, stderr = b"", b""
+        return {
+            "returncode": -1,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": f"CUA Driver subprocess timed out after {timeout} seconds.",
+            "timeout": True,
+        }
+    except Exception as err:
+        return {
+            "returncode": -1,
+            "stdout": b"",
+            "stderr": b"",
+            "error": str(err),
+            "timeout": False,
+        }
+
+
+def _spawn_daemon_sync(cmd: List[str]) -> bool:
+    """Spawns background daemon process without blocking parent execution."""
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(
+            cmd,
+            creationflags=flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as err:
+        logger.error(f"[CUA DAEMON SPAWN ERROR] {err}")
+        return False
 
 
 class CuaDriverClient:
@@ -26,8 +85,8 @@ class CuaDriverClient:
         )
         self.socket_pipe = getattr(settings, "CUA_SOCKET_PIPE", r"\\.\pipe\cua-driver")
         self.timeout = float(getattr(settings, "CUA_DRIVER_TIMEOUT", 15.0))
-        self._daemon_process: Optional[asyncio.subprocess.Process] = None
         self._daemon_checked = False
+        self._daemon_spawn_failed = False
         self._last_resolved_target: Dict[str, Any] = {}
 
     @classmethod
@@ -50,35 +109,33 @@ class CuaDriverClient:
             logger.error(f"[CUA CLIENT] CUA Driver binary not found at '{self.cua_binary_path}'.")
             return False
 
-        try:
-            res = await self._raw_call("list_windows", payload={}, timeout=3.0, auto_start_daemon=False, auto_recover=False)
-            if res.get("success"):
-                self._daemon_checked = True
-                return True
-        except Exception:
-            pass
+        # Quick probe to check if daemon is already responding
+        res = await self._raw_call("list_windows", payload={}, timeout=3.0, auto_start_daemon=False, auto_recover=False)
+        if res.get("success"):
+            self._daemon_checked = True
+            return True
+
+        if self._daemon_spawn_failed:
+            logger.warning("[CUA CLIENT] Previous daemon spawn attempt failed. Skipping repetitive spawn.")
+            return False
 
         logger.info(f"[CUA CLIENT] CUA Driver daemon unavailable on '{self.socket_pipe}'. Spawning `cua-driver serve` daemon...")
-        try:
-            self._daemon_process = await asyncio.create_subprocess_exec(
-                self.cua_binary_path,
-                "serve",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.sleep(1.5)
-
-            res = await self._raw_call("list_windows", payload={}, timeout=5.0, auto_start_daemon=False, auto_recover=False)
-            if res.get("success"):
-                logger.info("[CUA CLIENT] CUA Driver daemon successfully started and listening.")
-                self._daemon_checked = True
-                return True
-            else:
-                logger.warning(f"[CUA CLIENT] CUA daemon started but list_windows failed: {res.get('error')}")
-                return False
-        except Exception as err:
-            logger.error(f"[CUA CLIENT ERROR] Failed to start CUA Driver daemon: {err}")
+        spawn_ok = await asyncio.to_thread(_spawn_daemon_sync, [self.cua_binary_path, "serve"])
+        if not spawn_ok:
+            self._daemon_spawn_failed = True
             return False
+
+        await asyncio.sleep(1.5)
+
+        res = await self._raw_call("list_windows", payload={}, timeout=5.0, auto_start_daemon=False, auto_recover=False)
+        if res.get("success"):
+            logger.info("[CUA CLIENT] CUA Driver daemon successfully started and listening.")
+            self._daemon_checked = True
+            return True
+
+        logger.warning(f"[CUA CLIENT] CUA daemon started but list_windows failed: {res.get('error')}")
+        self._daemon_spawn_failed = True
+        return False
 
     async def resolve_window(
         self,
@@ -207,7 +264,8 @@ class CuaDriverClient:
             return {
                 "success": False,
                 "data": None,
-                "error": f"CUA Driver daemon unavailable: Binary missing at '{self.cua_binary_path}'",
+                "error_category": "SUBPROCESS_EXECUTION_ERROR",
+                "error": f"CUA Driver execution error: Binary missing at '{self.cua_binary_path}'",
             }
 
         cmd_payload = payload or {}
@@ -215,97 +273,96 @@ class CuaDriverClient:
         t_req = timeout or self.timeout
         t0 = time.time()
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self.cua_binary_path,
-                "call",
-                tool_name,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        cmd = [self.cua_binary_path, "call", tool_name]
 
-            try:
-                stdout_data, stderr_data = await asyncio.wait_for(
-                    proc.communicate(input=json_input),
-                    timeout=t_req,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                logger.error(f"[CUA CLIENT TIMEOUT] Tool '{tool_name}' timed out after {t_req}s.")
-                return {
-                    "success": False,
-                    "data": None,
-                    "error": f"CUA Driver subprocess timed out after {t_req} seconds for tool '{tool_name}'.",
-                }
+        # Use thread-pool executor to execute Popen synchronously without asyncio loop limitations
+        sub_res = await asyncio.to_thread(_run_subprocess_sync, cmd, json_input, t_req)
 
-            stdout_str = stdout_data.decode("utf-8", errors="replace").strip()
-            stderr_str = stderr_data.decode("utf-8", errors="replace").strip()
-            latency = (time.time() - t0) * 1000.0
-
-            if "Cua Driver daemon is not running" in stderr_str:
-                if auto_start_daemon:
-                    self._daemon_checked = False
-                    if await self.ensure_daemon_running():
-                        return await self._raw_call(tool_name, payload, timeout, auto_start_daemon=False, auto_recover=auto_recover)
-                return {
-                    "success": False,
-                    "data": None,
-                    "error": "CUA Driver daemon unavailable: Daemon is not running on pipe",
-                }
-
-            parsed_data = None
-            if stdout_str:
-                try:
-                    parsed_data = json.loads(stdout_str)
-                except json.JSONDecodeError:
-                    parsed_data = {"raw_output": stdout_str}
-
-            # Check for window_target_not_found / stale handle error
-            is_target_not_found = (
-                "window_target_not_found" in stderr_str.lower()
-                or (parsed_data and "window_target_not_found" in json.dumps(parsed_data).lower())
-                or (parsed_data and "target_not_found" in json.dumps(parsed_data).lower())
-            )
-
-            if is_target_not_found and auto_recover:
-                logger.warning(f"[CUA CLIENT STALE RECOVERY] tool='{tool_name}' reported target not found. Attempting live rediscovery...")
-                target_app = cmd_payload.get("app_name") or self._last_resolved_target.get("app_name")
-                target_title = cmd_payload.get("title") or self._last_resolved_target.get("title")
-                target_pid = cmd_payload.get("pid") or self._last_resolved_target.get("pid")
-
-                resolved = await self.resolve_window(pid=target_pid, app_name=target_app, title_contains=target_title, timeout=3.0)
-                if resolved.get("success") and resolved.get("window_id"):
-                    new_payload = dict(cmd_payload)
-                    new_payload["window_id"] = resolved["window_id"]
-                    if "pid" in new_payload:
-                        new_payload["pid"] = resolved["pid"]
-                    logger.info(f"[CUA CLIENT STALE RECOVERY] Target reacquired window_id={resolved['window_id']}. Retrying tool call...")
-                    return await self._raw_call(tool_name, new_payload, timeout, auto_start_daemon=False, auto_recover=False)
-
-            if proc.returncode != 0 and not stdout_str:
-                logger.error(f"[CUA CLIENT ERROR] tool='{tool_name}' exit_code={proc.returncode} stderr='{stderr_str}'")
-                return {
-                    "success": False,
-                    "data": None,
-                    "error": f"CUA Driver call error (code {proc.returncode}): {stderr_str or 'Unknown error'}",
-                }
-
-            logger.info(f"[CUA CLIENT SUCCESS] tool='{tool_name}' latency_ms={latency:.1f}ms")
-            return {
-                "success": True,
-                "data": parsed_data if parsed_data is not None else {},
-                "error": None,
-                "latency_ms": latency,
-            }
-
-        except Exception as err:
-            logger.error(f"[CUA CLIENT EXCEPTION] tool='{tool_name}' error='{err}'", exc_info=True)
+        if sub_res["timeout"]:
+            logger.error(f"[CUA CLIENT TIMEOUT] Tool '{tool_name}' timed out after {t_req}s.")
             return {
                 "success": False,
                 "data": None,
-                "error": f"CUA Driver invocation exception: {str(err)}",
+                "error_category": "TIMEOUT",
+                "error": f"CUA Driver subprocess timed out after {t_req} seconds for tool '{tool_name}'.",
             }
+
+        if sub_res["error"]:
+            logger.error(f"[CUA CLIENT SUBPROCESS ERROR] tool='{tool_name}' error='{sub_res['error']}'")
+            return {
+                "success": False,
+                "data": None,
+                "error_category": "SUBPROCESS_EXECUTION_ERROR",
+                "error": f"Subprocess execution unavailable: {sub_res['error']}",
+            }
+
+        stdout_bytes: bytes = sub_res["stdout"]
+        stderr_bytes: bytes = sub_res["stderr"]
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+        latency = (time.time() - t0) * 1000.0
+
+        # 1. Daemon unavailable error
+        if "Cua Driver daemon is not running" in stderr_str:
+            if auto_start_daemon and not self._daemon_spawn_failed:
+                self._daemon_checked = False
+                if await self.ensure_daemon_running():
+                    return await self._raw_call(tool_name, payload, timeout, auto_start_daemon=False, auto_recover=auto_recover)
+            return {
+                "success": False,
+                "data": None,
+                "error_category": "DAEMON_UNAVAILABLE",
+                "error": "CUA Driver daemon unavailable: Daemon is not running on pipe",
+            }
+
+        parsed_data = None
+        if stdout_str:
+            try:
+                parsed_data = json.loads(stdout_str)
+            except json.JSONDecodeError:
+                parsed_data = {"raw_output": stdout_str}
+
+        # 2. Stale handle / window target not found error recovery
+        is_target_not_found = (
+            "window_target_not_found" in stderr_str.lower()
+            or (parsed_data and "window_target_not_found" in json.dumps(parsed_data).lower())
+            or (parsed_data and "target_not_found" in json.dumps(parsed_data).lower())
+        )
+
+        if is_target_not_found and auto_recover:
+            logger.warning(f"[CUA CLIENT STALE RECOVERY] tool='{tool_name}' reported target not found. Attempting live rediscovery...")
+            target_app = cmd_payload.get("app_name") or self._last_resolved_target.get("app_name")
+            target_title = cmd_payload.get("title") or self._last_resolved_target.get("title")
+            target_pid = cmd_payload.get("pid") or self._last_resolved_target.get("pid")
+
+            resolved = await self.resolve_window(pid=target_pid, app_name=target_app, title_contains=target_title, timeout=3.0)
+            if resolved.get("success") and resolved.get("window_id"):
+                new_payload = dict(cmd_payload)
+                new_payload["window_id"] = resolved["window_id"]
+                if "pid" in new_payload:
+                    new_payload["pid"] = resolved["pid"]
+                logger.info(f"[CUA CLIENT STALE RECOVERY] Target reacquired window_id={resolved['window_id']}. Retrying tool call...")
+                return await self._raw_call(tool_name, new_payload, timeout, auto_start_daemon=False, auto_recover=False)
+
+        # 3. CUA tool execution error
+        returncode = sub_res["returncode"]
+        if returncode != 0 and not stdout_str:
+            logger.error(f"[CUA CLIENT ERROR] tool='{tool_name}' exit_code={returncode} stderr='{stderr_str}'")
+            return {
+                "success": False,
+                "data": None,
+                "error_category": "CUA_TOOL_ERROR",
+                "error": f"CUA Driver tool error (code {returncode}): {stderr_str or 'Unknown error'}",
+            }
+
+        logger.info(f"[CUA CLIENT SUCCESS] tool='{tool_name}' latency_ms={latency:.1f}ms")
+        return {
+            "success": True,
+            "data": parsed_data if parsed_data is not None else {},
+            "error_category": None,
+            "error": None,
+            "latency_ms": latency,
+        }
 
     # =========================================================================
     # CUA DRIVER TOOL INTERFACES WITH LIVE WINDOW RESOLUTION
@@ -340,7 +397,6 @@ class CuaDriverClient:
         launch_data = launch_res.get("data") or {}
         launched_pid = launch_data.get("pid")
 
-        # Resolve live window after launch to avoid stale PID/window_id
         resolved = await self.resolve_window(pid=launched_pid, app_name=app_identifier, title_contains=app_identifier, timeout=6.0)
 
         combined_data = dict(launch_data)

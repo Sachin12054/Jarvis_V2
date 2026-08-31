@@ -2,7 +2,6 @@ import re
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from app.execution.computer_gateway import ComputerUseGateway, ActionResult
-from app.agent.os.gesture_service import GestureControlService
 from app.core.logging import logger
 
 
@@ -36,6 +35,7 @@ class CommandRouter:
         # Priority 1: Gesture Control Lifecycle Commands
         if any(phrase in clean for phrase in ["enable gesture", "turn on gesture", "activate gesture"]):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='enable_gesture' clean='{clean}'")
+            from app.agent.os.gesture_service import GestureControlService
             res = GestureControlService.get_instance().enable_gesture_control()
             return RoutedCommand(
                 is_routed=True,
@@ -46,6 +46,7 @@ class CommandRouter:
 
         if any(phrase in clean for phrase in ["disable gesture", "turn off gesture", "deactivate gesture"]):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='disable_gesture' clean='{clean}'")
+            from app.agent.os.gesture_service import GestureControlService
             res = GestureControlService.get_instance().disable_gesture_control()
             return RoutedCommand(
                 is_routed=True,
