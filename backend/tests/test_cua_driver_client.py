@@ -43,7 +43,7 @@ async def test_cua_driver_json_invocation():
         mock_exec.return_value = mock_proc
 
         with patch.object(client, "ensure_daemon_running", new_callable=AsyncMock, return_value=True):
-            res = await client._raw_call("list_windows", {"test": "data"})
+            res = await client._raw_call("list_windows", {"test": "data"}, auto_recover=False)
             assert res["success"] is True
             assert res["data"] == {"status": "ok"}
 
@@ -69,14 +69,19 @@ async def test_cua_driver_list_windows():
 
 @pytest.mark.asyncio
 async def test_cua_driver_launch_app():
-    """Requirement D: Test launch_app tool call."""
+    """Requirement D: Test launch_app tool call with resolve_window mock."""
     client = CuaDriverClient.get_instance()
 
-    with patch.object(client, "_raw_call", new_callable=AsyncMock) as mock_raw:
+    with patch.object(client, "_raw_call", new_callable=AsyncMock) as mock_raw, \
+         patch.object(client, "resolve_window", new_callable=AsyncMock) as mock_resolve:
+
         mock_raw.return_value = {"success": True, "data": {"pid": 5678, "aumid": "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"}, "error": None}
+        mock_resolve.return_value = {"success": True, "window_id": 9999, "pid": 5678, "title": "Notepad", "app_name": "Notepad"}
+
         res = await client.launch_app("Notepad")
         assert res["success"] is True
-        mock_raw.assert_called_once_with("launch_app", {"name": "Notepad"})
+        assert res["data"]["window_id"] == 9999
+        mock_raw.assert_called_once_with("launch_app", {"path": "notepad.exe"})
 
 
 @pytest.mark.asyncio
@@ -125,7 +130,7 @@ async def test_jarvis_reasoning_to_gateway_loop():
          patch.object(gateway.cua_client, "type_text", new_callable=AsyncMock) as mock_type, \
          patch.object(gateway.cua_client, "verify_state", new_callable=AsyncMock) as mock_verify:
 
-        mock_launch.return_value = {"success": True, "data": {"pid": 9999}}
+        mock_launch.return_value = {"success": True, "data": {"pid": 9999, "window_id": 12345}}
         mock_type.return_value = {"success": True, "data": {"typed": True}}
         mock_verify.return_value = {"success": True, "data": {"verified": True}}
 
