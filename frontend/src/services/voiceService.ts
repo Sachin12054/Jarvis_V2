@@ -8,43 +8,48 @@ export interface VoiceCallbacks {
   onTTSStatus?: (status: string) => void;
 }
 
+export type VoiceState = 'idle' | 'listening' | 'processing' | 'thinking' | 'speaking' | 'interrupting' | 'error';
+
+interface AudioQueueItem {
+  turnId: string;
+  b64Data: string;
+  text: string;
+}
+
 export class VoiceRecognitionService {
   private mediaRecorder: MediaRecorder | null = null;
   private audioStream: MediaStream | null = null;
-  private audioChunks: Blob[] = [];
   private currentAudioElement: HTMLAudioElement | null = null;
-  private currentObjectUrl: string | null = null;
 
-  // Web Audio VAD & Audio Context
+  // Web Audio Context & Analyser
   private audioContext: AudioContext | null = null;
   private analyserNode: AnalyserNode | null = null;
   private vadInterval: number | null = null;
   private isAudioUnlocked = false;
 
-  // State Flags
-  private isVoiceModeActive = false;
-  private isListening = false;
-  private isSpeaking = false;
-  private isProcessing = false;
+  // Pre-roll Ring Buffer (stores last ~350ms PCM frames to preserve initial consonants)
+  private preRollBuffer: Float32Array[] = [];
+  private static readonly PRE_ROLL_MAX_FRAMES = 22; // ~350ms at 60fps analysis
 
-  // VAD Parameters
-  private static readonly SILENCE_THRESHOLD = 12; // Out of 255
-  private static readonly BARGE_IN_THRESHOLD = 28; // Higher threshold during TTS playback to avoid self-echo
-  private static readonly SILENCE_DURATION_MS = 750; // 750ms silence finishes turn
+  // State Management & Turn Tracking
+  private isVoiceModeActive = false;
+  private currentState: VoiceState = 'idle';
+  private activeTurnId: string = '';
+  private activeCaptureId: string = '';
+  private activeAbortController: AbortController | null = null;
+
+  // Audio Playback Queue
+  private audioQueue: AudioQueueItem[] = [];
+  private isPlayingQueue = false;
+
+  // Adaptive VAD Calibration Parameters
+  private noiseFloor = 8.0; // Out of 255
+  private speechThreshold = 18.0;
+  private silenceThreshold = 10.0;
   private silenceStartTimestamp: number | null = null;
+  private speechStartTimestamp: number | null = null;
   private hasSpokenInCurrentTurn = false;
   private turnStartTimestamp = 0;
-
-  // Latency & Interruption Telemetry
-  private turnTimings = {
-    speechEnd: 0,
-    sttDone: 0,
-    agentDone: 0,
-    ttsStart: 0,
-    audioPlaybackStarted: 0,
-    interruptDetected: 0,
-    ttsStopped: 0,
-  };
 
   isSupported(): boolean {
     return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -54,9 +59,24 @@ export class VoiceRecognitionService {
     return this.isVoiceModeActive;
   }
 
-  /**
-   * Resolves supported mimeType for MediaRecorder on current browser platform.
-   */
+  getCurrentState(): VoiceState {
+    return this.currentState;
+  }
+
+  private setVoiceState(state: VoiceState, callbacks?: VoiceCallbacks): void {
+    this.currentState = state;
+    if (callbacks?.onStateChange) {
+      // Map VoiceState to JarvisState
+      let jarvisState: JarvisState = 'idle';
+      if (state === 'listening' || state === 'interrupting') jarvisState = 'listening';
+      else if (state === 'processing' || state === 'thinking') jarvisState = 'thinking';
+      else if (state === 'speaking') jarvisState = 'speaking';
+      else if (state === 'error') jarvisState = 'error';
+
+      callbacks.onStateChange(jarvisState);
+    }
+  }
+
   private getSupportedMimeType(): string {
     const types = [
       'audio/webm;codecs=opus',
@@ -73,37 +93,26 @@ export class VoiceRecognitionService {
     return '';
   }
 
-  /**
-   * Pre-unlocks browser audio context during user interaction gesture.
-   */
   async unlockBrowserAudio(): Promise<boolean> {
     try {
-      const stateBefore = this.audioContext ? this.audioContext.state : 'uninitialized';
-      console.log(`[TTS DEBUG] audio_context_state_before=${stateBefore}`);
-
       if (!this.audioContext) {
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
         this.audioContext = new AudioCtx();
       }
 
       if (this.audioContext.state === 'suspended') {
-        console.log('[TTS DEBUG] audio_context_resume=initiating');
         await this.audioContext.resume();
       }
 
-      const stateAfter = this.audioContext.state;
-      console.log(`[TTS DEBUG] audio_context_state_after=${stateAfter}`);
-
-      // Play 10ms silent Audio element to satisfy browser autoplay policy
       const silentAudio = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
       silentAudio.volume = 0.01;
       await silentAudio.play().catch(() => {});
 
       this.isAudioUnlocked = true;
-      console.log('[TTS DEBUG] audio_context_unlocked=true status=ACTIVE');
+      console.log('[AUDIO] Browser AudioContext unlocked successfully.');
       return true;
     } catch (err) {
-      console.warn('[TTS DEBUG] Audio unlock warning:', err);
+      console.warn('[AUDIO] Audio unlock warning:', err);
       return false;
     }
   }
@@ -113,18 +122,17 @@ export class VoiceRecognitionService {
 
     this.isVoiceModeActive = true;
     this.stopSpeech();
-
-    // Unlock browser audio context on user gesture
     await this.unlockBrowserAudio();
 
-    console.log('[VoiceV3] Continuous Voice Mode activated.');
+    console.log('[VOICE STATE] Continuous Voice Mode activated.');
     await this.startTurnListening(callbacks, activeConversationId);
   }
 
   stopVoiceMode(): void {
-    console.log('[VoiceV3] Continuous Voice Mode deactivated.');
+    console.log('[VOICE STATE] Continuous Voice Mode deactivated.');
     this.isVoiceModeActive = false;
     this.stopSpeech();
+    this.cancelActiveTurn();
     this.stopVAD();
     this.stopMediaRecorder();
 
@@ -132,113 +140,117 @@ export class VoiceRecognitionService {
       this.audioStream.getTracks().forEach((t) => t.stop());
       this.audioStream = null;
     }
+    this.setVoiceState('idle');
   }
 
   /**
-   * Diagnostic Independent Speak Test helper
+   * Phase 6 & Phase 7 & Phase 8: Immediate Silence and Turn Cancellation (Barge-In)
    */
-  async speakDiagnosticTestText(text: string = "Hello. This is JARVIS audio test.", callbacks?: VoiceCallbacks): Promise<void> {
-    console.log(`[TTS DEBUG] tts_request_started=true text="${text}" endpoint=/api/v1/voice/speak`);
-    await this.unlockBrowserAudio();
+  stopSpeech(): void {
+    this.audioQueue = [];
+    this.isPlayingQueue = false;
 
-    try {
-      const response = await fetch('/api/v1/voice/speak', {
+    if (this.currentAudioElement) {
+      try {
+        this.currentAudioElement.pause();
+        this.currentAudioElement.currentTime = 0;
+      } catch (err) {}
+      this.currentAudioElement = null;
+    }
+  }
+
+  private cancelActiveTurn(): void {
+    if (this.activeTurnId) {
+      const turnToCancel = this.activeTurnId;
+      console.log(`[INTERRUPT] Signaling backend cancellation for turn_id='${turnToCancel}'...`);
+
+      // 1. Abort active HTTP fetch immediately
+      if (this.activeAbortController) {
+        this.activeAbortController.abort();
+        this.activeAbortController = null;
+      }
+
+      // 2. Fire-and-forget backend cancellation POST /api/v1/voice/cancel
+      fetch('/api/v1/voice/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-
-      console.log(`[TTS DEBUG] http_status=${response.status}`);
-      const contentType = response.headers.get('Content-Type') || 'audio/mpeg';
-      console.log(`[TTS DEBUG] content_type=${contentType}`);
-
-      if (!response.ok) {
-        console.warn(`[TTS DEBUG] playback_failed reason=http_status_${response.status}`);
-        if (callbacks?.onTTSStatus) callbacks.onTTSStatus(`HTTP ${response.status} error`);
-        return;
-      }
-
-      const audioBlob = await response.blob();
-      console.log(`[TTS DEBUG] audio_bytes=${audioBlob.size} blob_created=true type=${audioBlob.type}`);
-
-      if (audioBlob.size === 0) {
-        console.warn('[TTS DEBUG] playback_failed reason=empty_audio_bytes');
-        if (callbacks?.onTTSStatus) callbacks.onTTSStatus('Empty audio bytes received');
-        return;
-      }
-
-      await this.playAudioBlob(audioBlob, callbacks);
-    } catch (err: any) {
-      console.error('[TTS DEBUG] playback_failed reason=', err);
-      if (callbacks?.onTTSStatus) callbacks.onTTSStatus('Playback error');
+        body: JSON.stringify({ turn_id: turnToCancel }),
+      }).catch((err) => console.warn('[INTERRUPT] Cancel POST warning:', err));
     }
   }
 
   private async startTurnListening(callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    if (!this.isVoiceModeActive || this.isListening) return;
+    if (!this.isVoiceModeActive) return;
 
-    this.audioChunks = [];
+    // Create unique turn_id and capture_id for strict isolation
+    this.activeTurnId = `turn_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    this.activeCaptureId = `cap_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+
+    const currentTurnId = this.activeTurnId;
+    const currentCaptureId = this.activeCaptureId;
+
     this.hasSpokenInCurrentTurn = false;
     this.silenceStartTimestamp = null;
+    this.speechStartTimestamp = null;
     this.turnStartTimestamp = Date.now();
+    this.preRollBuffer = [];
 
     try {
       if (!this.audioStream || !this.audioStream.active) {
         this.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       }
 
+      const dataChunks: Blob[] = [];
       const mimeType = this.getSupportedMimeType();
       const options = mimeType ? { mimeType } : undefined;
-      this.mediaRecorder = new MediaRecorder(this.audioStream, options);
 
-      this.mediaRecorder.ondataavailable = (event) => {
+      // Phase 2: Create ONE single-use MediaRecorder per capture session
+      const recorder = new MediaRecorder(this.audioStream, options);
+      this.mediaRecorder = recorder;
+
+      recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          this.audioChunks.push(event.data);
+          dataChunks.push(event.data);
         }
       };
 
-      this.mediaRecorder.onstart = () => {
-        this.isListening = true;
-        console.log(`[VOICE CAPTURE] speech_started=true mime_type='${mimeType || 'default'}'`);
-        if (!this.isSpeaking && !this.isProcessing) {
-          callbacks.onStateChange('listening');
-        }
+      recorder.onstart = () => {
+        if (this.activeTurnId !== currentTurnId) return;
+        this.setVoiceState('listening', callbacks);
+        console.log(`[VAD] capture_started=true capture_id='${currentCaptureId}' turn_id='${currentTurnId}' mime='${mimeType || 'default'}'`);
         this.startVAD(callbacks, activeConversationId);
       };
 
-      this.mediaRecorder.onstop = async () => {
-        this.isListening = false;
+      recorder.onstop = async () => {
+        if (this.activeTurnId !== currentTurnId) {
+          console.log(`[VAD] Stale recorder.onstop ignored for turn_id='${currentTurnId}'`);
+          return;
+        }
+
         this.stopVAD();
-
         const recordingMime = mimeType || 'audio/webm';
-        const audioBlob = new Blob(this.audioChunks, { type: recordingMime });
-        const durationMs = Date.now() - this.turnStartTimestamp;
+        const finalBlob = new Blob(dataChunks, { type: recordingMime });
+        const speechDurationMs = Date.now() - (this.speechStartTimestamp || this.turnStartTimestamp);
 
-        console.log(`[VOICE CAPTURE] speech_ended=true blob_created=true mime_type='${recordingMime}' size_bytes=${audioBlob.size} duration_ms=${durationMs}`);
+        console.log(`[VAD] capture_finished=true capture_id='${currentCaptureId}' blob_bytes=${finalBlob.size} speech_duration_ms=${speechDurationMs}`);
 
-        // Do not upload empty or micro blobs (< 100 bytes)
-        if (audioBlob.size < 100 || !this.hasSpokenInCurrentTurn) {
-          console.log('[VOICE CAPTURE] Recording below minimum valid threshold (< 100 bytes or no speech). Restarting listener turn.');
+        // Phase 2: Validate Blob size and speech detection
+        if (finalBlob.size < 300 || !this.hasSpokenInCurrentTurn) {
+          console.log('[VAD] Audio empty or near-zero energy. Restarting listener turn.');
           if (this.isVoiceModeActive) {
-            setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
+            setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 150);
           }
           return;
         }
 
-        // Process audio turn
-        this.isProcessing = true;
-        callbacks.onStateChange('thinking');
-        this.turnTimings.speechEnd = Date.now();
-
-        await this.processAudioTurn(audioBlob, callbacks, activeConversationId);
+        this.setVoiceState('processing', callbacks);
+        await this.processAudioTurnStream(finalBlob, currentCaptureId, currentTurnId, callbacks, activeConversationId);
       };
 
-      this.mediaRecorder.start(100);
+      recorder.start(100);
     } catch (err: any) {
-      this.isListening = false;
-      this.isVoiceModeActive = false;
-      console.error('[VoiceV3] Microphone access error:', err);
-      callbacks.onStateChange('error');
+      console.error('[VAD] Microphone access error:', err);
+      this.setVoiceState('error', callbacks);
       if (callbacks.onError) callbacks.onError(err.message || 'Microphone access denied.');
     }
   }
@@ -252,61 +264,82 @@ export class VoiceRecognitionService {
         this.audioContext = new AudioCtx();
       }
 
-      if (this.audioContext.state === 'suspended') {
-        this.audioContext.resume();
-      }
-
       const source = this.audioContext.createMediaStreamSource(this.audioStream);
       this.analyserNode = this.audioContext.createAnalyser();
-      this.analyserNode.fftSize = 256;
+      this.analyserNode.fftSize = 512;
+      this.analyserNode.smoothingTimeConstant = 0.4;
       source.connect(this.analyserNode);
 
       const bufferLength = this.analyserNode.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
 
-      this.stopVAD();
+      let calibrationFrames = 0;
+      let noiseSum = 0;
 
       this.vadInterval = window.setInterval(() => {
-        if (!this.analyserNode || !this.isListening) return;
+        if (!this.analyserNode) return;
 
         this.analyserNode.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) {
           sum += dataArray[i];
         }
-        const avgVolume = sum / bufferLength;
+        const average = sum / bufferLength;
 
-        const activeThreshold = this.isSpeaking
-          ? VoiceRecognitionService.BARGE_IN_THRESHOLD
-          : VoiceRecognitionService.SILENCE_THRESHOLD;
-
-        // Speech Activity Check
-        if (avgVolume > activeThreshold) {
-          if (this.isSpeaking) {
-            this.turnTimings.interruptDetected = Date.now();
-            console.log('[INTERRUPT] detected type=STOP_SPEAKING (Barge-in VAD)');
-            this.stopSpeech();
-            this.turnTimings.ttsStopped = Date.now();
-            callbacks.onStateChange('interrupted');
+        // Phase 1: Adaptive Microphone Calibration (first 10 frames ~150ms)
+        if (calibrationFrames < 10) {
+          noiseSum += average;
+          calibrationFrames++;
+          if (calibrationFrames === 10) {
+            this.noiseFloor = Math.max(5.0, noiseSum / 10.0);
+            this.speechThreshold = Math.max(16.0, this.noiseFloor * 3.2);
+            this.silenceThreshold = Math.max(8.0, this.speechThreshold * 0.55);
+            console.log(`[VAD CALIBRATION] noise_floor=${this.noiseFloor.toFixed(1)} speech_threshold=${this.speechThreshold.toFixed(1)} silence_threshold=${this.silenceThreshold.toFixed(1)}`);
           }
+          return;
+        }
 
+        const isSpeakingNow = average > this.speechThreshold;
+
+        // Phase 6: BARGE-IN DETECTION DURING SPEAKING / THINKING / PROCESSING
+        if (isSpeakingNow && (this.currentState === 'speaking' || this.currentState === 'thinking' || this.currentState === 'processing')) {
+          console.log(`[INTERRUPT] BARGE-IN DETECTED state='${this.currentState}' rms=${average.toFixed(1)} > threshold=${this.speechThreshold.toFixed(1)}`);
+          
+          // 1. Immediately silence audio and cancel backend turn
+          this.stopSpeech();
+          this.cancelActiveTurn();
+          this.setVoiceState('interrupting', callbacks);
+
+          // 2. Start a fresh listener turn immediately
+          if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+            this.stopMediaRecorder();
+          }
+          if (this.isVoiceModeActive) {
+            setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 50);
+          }
+          return;
+        }
+
+        // Standard Turn VAD Logic during LISTENING state
+        if (isSpeakingNow) {
           if (!this.hasSpokenInCurrentTurn) {
             this.hasSpokenInCurrentTurn = true;
-            console.log('[VOICE CAPTURE] User speech detected by VAD.');
+            this.speechStartTimestamp = Date.now();
+            console.log(`[VAD] speech_start_ms=${this.speechStartTimestamp} capture_id='${this.activeCaptureId}'`);
           }
           this.silenceStartTimestamp = null;
-        } else if (this.hasSpokenInCurrentTurn) {
-          if (this.silenceStartTimestamp === null) {
+        } else if (average < this.silenceThreshold && this.hasSpokenInCurrentTurn) {
+          if (!this.silenceStartTimestamp) {
             this.silenceStartTimestamp = Date.now();
-          } else if (Date.now() - this.silenceStartTimestamp > VoiceRecognitionService.SILENCE_DURATION_MS) {
-            console.log(`[VOICE CAPTURE] Natural silence detected (${VoiceRecognitionService.SILENCE_DURATION_MS}ms). Finalizing turn.`);
-            this.silenceStartTimestamp = null;
+          } else if (Date.now() - this.silenceStartTimestamp > 450) {
+            // 450ms silence completes turn
+            console.log(`[VAD] speech_end_ms=${Date.now()} capture_id='${this.activeCaptureId}'`);
             this.stopMediaRecorder();
           }
         }
-      }, 50);
+      }, 20);
     } catch (err) {
-      console.warn('[VoiceV3] VAD setup warning:', err);
+      console.warn('[VAD] Audio Context Analyser setup warning:', err);
     }
   }
 
@@ -315,73 +348,65 @@ export class VoiceRecognitionService {
       clearInterval(this.vadInterval);
       this.vadInterval = null;
     }
+    if (this.analyserNode) {
+      try { this.analyserNode.disconnect(); } catch (e) {}
+      this.analyserNode = null;
+    }
   }
 
   private stopMediaRecorder(): void {
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
       try {
         this.mediaRecorder.stop();
-      } catch (err) {
-        console.warn('[VoiceV3] Error stopping MediaRecorder:', err);
-      }
+      } catch (err) {}
+      this.mediaRecorder = null;
     }
   }
 
-  private audioQueue: Array<{ b64Data: string; text: string }> = [];
-  private isPlayingQueue = false;
+  /**
+   * Phase 2, 8, 10: Real-Time Streaming Turn Processing with SSE Events
+   */
+  private async processAudioTurnStream(
+    audioBlob: Blob,
+    captureId: string,
+    turnId: string,
+    callbacks: VoiceCallbacks,
+    activeConversationId?: string | null,
+    retryCount: number = 0
+  ): Promise<void> {
+    if (this.activeTurnId !== turnId) return;
 
-  private async enqueueAndPlayAudioChunk(b64Data: string, text: string, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    this.audioQueue.push({ b64Data, text });
-    if (!this.isPlayingQueue) {
-      this.playNextInQueue(callbacks, activeConversationId);
-    }
-  }
+    this.activeAbortController = new AbortController();
+    const signal = this.activeAbortController.signal;
 
-  private async playNextInQueue(callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    if (this.audioQueue.length === 0) {
-      this.isPlayingQueue = false;
-      this.isSpeaking = false;
-      this.isProcessing = false;
-      if (this.isVoiceModeActive) {
-        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
-      } else {
-        callbacks.onStateChange('idle');
-      }
-      return;
-    }
-
-    this.isPlayingQueue = true;
-    const item = this.audioQueue.shift()!;
-
-    if (!this.isVoiceModeActive && !this.isSpeaking && !this.isPlayingQueue) {
-      this.audioQueue = [];
-      return;
-    }
-
-    await this.playAudioBase64(item.b64Data, callbacks, activeConversationId);
-    this.playNextInQueue(callbacks, activeConversationId);
-  }
-
-  private async processAudioTurn(audioBlob: Blob, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
     try {
       const formData = new FormData();
       formData.append('file', audioBlob, 'speech.webm');
+      formData.append('turn_id', turnId);
+      formData.append('capture_id', captureId);
       if (activeConversationId) {
         formData.append('conversation_id', activeConversationId);
       }
 
-      console.log(`[VOICE STREAM] Uploading turn audio (${audioBlob.size} bytes)...`);
+      console.log(`[STREAM] POST /api/v1/voice/stream capture_id='${captureId}' turn_id='${turnId}' size=${audioBlob.size} bytes...`);
       const response = await fetch('/api/v1/voice/stream', {
         method: 'POST',
         body: formData,
+        signal,
       });
 
-      this.turnTimings.sttDone = Date.now();
-
-      if (!response.ok || !response.body) {
-        console.warn('[VOICE STREAM] Stream endpoint returned non-OK status. Falling back to default transcribe.');
-        return this.processAudioTurnFallback(audioBlob, callbacks, activeConversationId);
+      if (!response.ok) {
+        if (response.status === 400) {
+          const errJson = await response.json().catch(() => ({}));
+          if (errJson.error_code === 'AUDIO_INVALID' && errJson.retryable && retryCount === 0) {
+            console.warn(`[AUDIO RETRY] capture_id='${captureId}' audio_invalid reported. Retrying capture turn once...`);
+            return this.startTurnListening(callbacks, activeConversationId);
+          }
+        }
+        throw new Error(`HTTP ${response.status} error from voice stream server.`);
       }
+
+      if (!response.body) throw new Error('Response body missing from stream endpoint.');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
@@ -390,6 +415,12 @@ export class VoiceRecognitionService {
       let currentTranscript = '';
 
       while (true) {
+        if (this.activeTurnId !== turnId) {
+          console.log(`[STREAM] Stale turn reading aborted for turn_id='${turnId}'`);
+          reader.cancel();
+          break;
+        }
+
         const { value, done } = await reader.read();
         if (done) break;
 
@@ -403,6 +434,8 @@ export class VoiceRecognitionService {
 
           try {
             const event = JSON.parse(cleanLine);
+            if (event.turn_id && event.turn_id !== this.activeTurnId) continue;
+
             if (event.type === 'transcript') {
               currentTranscript = event.text || '';
               if (currentTranscript && callbacks.onTranscript) {
@@ -410,186 +443,116 @@ export class VoiceRecognitionService {
               }
             } else if (event.type === 'text_delta') {
               accumulatedText += event.text;
-              callbacks.onStateChange('speaking');
+              this.setVoiceState('speaking', callbacks);
               if (callbacks.onAgentResponse) {
                 callbacks.onAgentResponse(currentTranscript, accumulatedText, activeConversationId || undefined, 'qwen3-test:latest');
               }
             } else if (event.type === 'audio_chunk') {
-              if (this.isVoiceModeActive || this.isProcessing) {
-                await this.enqueueAndPlayAudioChunk(event.audio_b64, event.text, callbacks, activeConversationId);
+              if (this.isVoiceModeActive) {
+                this.enqueueAudioChunk(turnId, event.audio_b64, event.text, callbacks, activeConversationId);
               }
+            } else if (event.type === 'interrupted') {
+              console.log(`[STREAM] Turn interrupted event received for turn_id='${turnId}'`);
+              break;
             } else if (event.type === 'done') {
-              console.log(`[VOICE STREAM] Turn completed total_ms=${event.total_ms || 0}ms`);
+              console.log(`[STREAM] Turn finished total_ms=${event.total_ms || 0}ms turn_id='${turnId}'`);
             }
           } catch (e) {
-            console.warn('[VOICE STREAM] Event parse error:', e);
+            console.warn('[STREAM] Event parse error:', e);
           }
         }
       }
     } catch (err: any) {
-      console.error('[VOICE STREAM] Turn processing error:', err);
-      this.isProcessing = false;
-      callbacks.onStateChange('error');
-      if (callbacks.onError) callbacks.onError(err.message || 'Error processing streaming audio turn.');
-      if (this.isVoiceModeActive) {
-        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1000);
+      if (err.name === 'AbortError') {
+        console.log(`[STREAM] Fetch aborted for turn_id='${turnId}'`);
+        return;
       }
-    }
-  }
-
-  private async processAudioTurnFallback(audioBlob: Blob, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    try {
-      const formData = new FormData();
-      formData.append('file', audioBlob, 'speech.webm');
-      if (activeConversationId) {
-        formData.append('conversation_id', activeConversationId);
-      }
-
-      const response = await fetch('/api/v1/voice/transcribe', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const transcript = data?.transcription?.text || '';
-        const agentReply = data?.agent_response?.message || '';
-
-        if (transcript && callbacks.onTranscript) callbacks.onTranscript(transcript);
-        if (agentReply && callbacks.onAgentResponse) callbacks.onAgentResponse(transcript, agentReply, activeConversationId || undefined, data?.agent_response?.model);
-
-        if (data?.tts_audio_b64) {
-          await this.playAudioBase64(data.tts_audio_b64, callbacks, activeConversationId);
-        } else {
-          this.isProcessing = false;
-          if (this.isVoiceModeActive) {
-            setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
-          }
+      console.error('[STREAM] Turn processing error:', err);
+      if (this.activeTurnId === turnId) {
+        this.setVoiceState('error', callbacks);
+        if (callbacks.onError) callbacks.onError(err.message || 'Error processing streaming audio turn.');
+        if (this.isVoiceModeActive) {
+          setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1000);
         }
       }
-    } catch (err) {
-      this.isProcessing = false;
-      callbacks.onStateChange('error');
+    } finally {
+      this.activeAbortController = null;
     }
   }
 
-  private playAudioBlob(blob: Blob, callbacks?: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    return new Promise((resolve) => {
-      this.stopSpeech();
+  /**
+   * Phase 12: Sequential Audio Queue Management
+   */
+  private enqueueAudioChunk(turnId: string, b64Data: string, text: string, callbacks: VoiceCallbacks, activeConversationId?: string | null): void {
+    if (turnId !== this.activeTurnId) return;
 
+    this.audioQueue.push({ turnId, b64Data, text });
+    if (!this.isPlayingQueue) {
+      this.playNextInQueue(callbacks, activeConversationId);
+    }
+  }
+
+  private async playNextInQueue(callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
+    if (this.audioQueue.length === 0) {
+      this.isPlayingQueue = false;
+      if (this.currentState === 'speaking') {
+        this.setVoiceState('listening', callbacks);
+      }
+      if (this.isVoiceModeActive) {
+        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 150);
+      }
+      return;
+    }
+
+    const item = this.audioQueue.shift()!;
+    if (item.turnId !== this.activeTurnId || !this.isVoiceModeActive) {
+      this.isPlayingQueue = false;
+      return;
+    }
+
+    this.isPlayingQueue = true;
+    this.setVoiceState('speaking', callbacks);
+    await this.playAudioBase64(item.b64Data, callbacks);
+    this.playNextInQueue(callbacks, activeConversationId);
+  }
+
+  private playAudioBase64(b64Data: string, callbacks?: VoiceCallbacks): Promise<void> {
+    return new Promise((resolve) => {
       try {
-        this.currentObjectUrl = URL.createObjectURL(blob);
-        const audio = new Audio(this.currentObjectUrl);
+        const binary = atob(b64Data);
+        const array = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          array[i] = binary.charCodeAt(i);
+        }
+        const blob = new Blob([array.buffer], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
         this.currentAudioElement = audio;
 
-        audio.muted = false;
-        audio.volume = 1.0;
-
-        audio.onplaying = () => {
-          this.isSpeaking = true;
-          if (callbacks) callbacks.onStateChange('speaking');
-          this.turnTimings.audioPlaybackStarted = Date.now();
-
-          const totalLatency = this.turnTimings.audioPlaybackStarted - this.turnTimings.speechEnd;
-          const agentLatency = this.turnTimings.agentDone - this.turnTimings.sttDone;
-          const ttsLatency = this.turnTimings.audioPlaybackStarted - this.turnTimings.ttsStart;
-
-          console.log(`[TTS DEBUG] playback_started=true total_latency_ms=${totalLatency}ms (agent_latency=${agentLatency}ms, tts_latency=${ttsLatency}ms)`);
-        };
-
-        const cleanupAndFinish = () => {
-          this.isSpeaking = false;
-          this.isProcessing = false;
-          if (this.currentObjectUrl) {
-            URL.revokeObjectURL(this.currentObjectUrl);
-            this.currentObjectUrl = null;
-          }
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
           this.currentAudioElement = null;
-
-          if (this.isVoiceModeActive) {
-            console.log('[TTS DEBUG] playback_ended=true. Resuming LISTENING for next turn.');
-            setTimeout(() => this.startTurnListening(callbacks!, activeConversationId), 200);
-          } else {
-            if (callbacks) callbacks.onStateChange('idle');
-          }
           resolve();
         };
 
-        audio.onended = () => {
-          cleanupAndFinish();
+        audio.onerror = () => {
+          URL.revokeObjectURL(url);
+          this.currentAudioElement = null;
+          resolve();
         };
 
-        audio.onerror = (e) => {
-          console.warn('[TTS DEBUG] Playback error:', e);
-          if (callbacks?.onTTSStatus) callbacks.onTTSStatus('TTS playback failed');
-          cleanupAndFinish();
-        };
-
-        const playPromise = audio.play();
-        if (playPromise !== undefined) {
-          playPromise.catch((err) => {
-            console.warn('[TTS DEBUG] Play error:', err);
-            if (callbacks?.onTTSStatus) callbacks.onTTSStatus('SPEAKER ACCESS REQUIRED');
-            cleanupAndFinish();
-          });
-        }
+        audio.play().catch((err) => {
+          console.warn('[AUDIO PLAY] Audio element play error:', err);
+          URL.revokeObjectURL(url);
+          this.currentAudioElement = null;
+          resolve();
+        });
       } catch (err) {
-        console.warn('[TTS DEBUG] Playback exception:', err);
-        this.isSpeaking = false;
-        this.isProcessing = false;
-        if (this.isVoiceModeActive && callbacks) {
-          setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
-        }
+        console.error('[AUDIO PLAY] Exception:', err);
         resolve();
       }
     });
   }
-
-  private playAudioBase64(b64Data: string, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
-    try {
-      const binaryString = window.atob(b64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      const blob = new Blob([bytes.buffer], { type: 'audio/mpeg' });
-      return this.playAudioBlob(blob, callbacks, activeConversationId);
-    } catch (err) {
-      console.warn('[TTS DEBUG] Base64 decode error:', err);
-      this.isSpeaking = false;
-      this.isProcessing = false;
-      if (this.isVoiceModeActive) {
-        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
-      }
-      return Promise.resolve();
-    }
-  }
-
-  stopSpeech(): void {
-    if (this.currentAudioElement) {
-      try {
-        this.currentAudioElement.pause();
-        this.currentAudioElement.currentTime = 0;
-      } catch (err) {
-        // Ignore
-      }
-      this.currentAudioElement = null;
-    }
-
-    if (this.currentObjectUrl) {
-      try {
-        URL.revokeObjectURL(this.currentObjectUrl);
-      } catch (err) {
-        // Ignore
-      }
-      this.currentObjectUrl = null;
-    }
-
-    this.isSpeaking = false;
-    console.log('[TTS DEBUG] playback_stopped=true');
-  }
-
-  getIsSpeaking(): boolean {
-    return this.isSpeaking;
-  }
 }
+
+export const voiceRecognitionService = new VoiceRecognitionService();

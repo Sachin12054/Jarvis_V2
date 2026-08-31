@@ -39,9 +39,10 @@ class Settings(BaseSettings):
 
     # Local Whisper Speech-to-Text (STT) Settings
     JARVIS_STT_PROVIDER: str = Field(default="local_whisper", description="STT Provider: local_whisper")
-    JARVIS_STT_MODEL: str = Field(default="tiny", description="Local Whisper model: tiny, base, small, medium")
+    JARVIS_STT_MODEL: str = Field(default="base.en", description="Local Whisper model: tiny, base, base.en, small, small.en, medium")
     JARVIS_STT_ENGINE: str = Field(default="faster-whisper", description="Local STT engine: faster-whisper")
-    JARVIS_STT_DEVICE: str = Field(default="cpu", description="Device: auto, cuda, cpu")
+    JARVIS_STT_DEVICE: str = Field(default="auto", description="Device: auto, cuda, cpu")
+    JARVIS_STT_COMPUTE_TYPE: str = Field(default="auto", description="Compute type: auto, float16, int8, float32")
     JARVIS_STT_PORT: int = Field(default=8001, description="Localhost Whisper server port")
 
     # Local Text-to-Speech (TTS) Settings - Kokoro-82M

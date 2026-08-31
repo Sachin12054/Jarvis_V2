@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from app.brain.context_manager import ContextManager
 from app.brain.llm_manager import LLMManager
@@ -69,6 +70,7 @@ class JARVISOrchestrator:
         history: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         memory_context: Optional[str] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Executes a single dialogue turn streaming responses chunk by chunk."""
         safe_history = normalize_history(history)
@@ -91,6 +93,7 @@ class JARVISOrchestrator:
         async for chunk in self.llm_manager.generate_stream(
             messages=formatted_messages,
             model=active_model,
+            cancel_event=cancel_event,
         ):
             yield {
                 "chunk": chunk,

@@ -17,7 +17,8 @@ export const TopHeader: React.FC = () => {
   useEffect(() => {
     let isMounted = true;
     const fetchStatus = async () => {
-      if (useJarvisStore.getState().currentState === 'thinking') {
+      const state = useJarvisStore.getState().currentState;
+      if (state === 'thinking' || state === 'speaking' || state === 'listening') {
         return;
       }
       const status = await systemServiceRef.current.getModelStatus();

@@ -55,6 +55,7 @@ async def stream_chat_and_tts(
     text_stream: AsyncGenerator[str, None],
     tts_service: Optional[LocalKokoroTTSService] = None,
     min_chunk_length: int = 15,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Consumes an LLM text delta stream, filters out internal thinking, accumulates phrases,
     synthesizes TTS chunks using Kokoro, and yields SSE event payloads.
@@ -67,6 +68,10 @@ async def stream_chat_and_tts(
     first_audio_sent = False
 
     async for chunk in text_stream:
+        if cancel_event and cancel_event.is_set():
+            logger.info("[STREAMING TTS] Stream cancelled via cancel_event.")
+            return
+
         clean_text = filter_engine.process_chunk(chunk)
         if not clean_text:
             continue
@@ -86,10 +91,10 @@ async def stream_chat_and_tts(
             phrase = accumulator[:boundary_idx].strip()
             accumulator = accumulator[boundary_idx:]
 
-            if phrase and tts.is_configured():
+            if phrase and tts.is_configured() and not (cancel_event and cancel_event.is_set()):
                 t_tts0 = time.time()
                 audio_bytes = await tts.generate_speech(phrase)
-                if audio_bytes:
+                if audio_bytes and not (cancel_event and cancel_event.is_set()):
                     b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
                     if not first_audio_sent:
                         first_audio_ms = (time.time() - t_start) * 1000.0
@@ -104,13 +109,16 @@ async def stream_chat_and_tts(
                         "latency_ms": (time.time() - t_tts0) * 1000.0,
                     }
 
+    if cancel_event and cancel_event.is_set():
+        return
+
     # Flush remaining buffer
     remaining_text = filter_engine.flush() + accumulator
-    if remaining_text.strip() and tts.is_configured():
+    if remaining_text.strip() and tts.is_configured() and not (cancel_event and cancel_event.is_set()):
         phrase = remaining_text.strip()
         t_tts0 = time.time()
         audio_bytes = await tts.generate_speech(phrase)
-        if audio_bytes:
+        if audio_bytes and not (cancel_event and cancel_event.is_set()):
             b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
             yield {
                 "type": "audio_chunk",

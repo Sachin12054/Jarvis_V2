@@ -43,6 +43,31 @@ except Exception as fw_err:
     FASTER_WHISPER_IMPORT_ERROR = str(fw_err)
 
 
+def check_cuda_available() -> bool:
+    """Checks if CUDA GPU device is available and required cuBLAS DLLs are present on Windows."""
+    if not CTRANSLATE2_AVAILABLE:
+        return False
+    try:
+        # Check for cublas64_12.dll / cublas64_11.dll DLL availability
+        has_cublas = False
+        if shutil.which("cublas64_12.dll") or shutil.which("cublas64_11.dll"):
+            has_cublas = True
+        else:
+            cuda_path = os.environ.get("CUDA_PATH", "")
+            if cuda_path and (os.path.exists(os.path.join(cuda_path, "bin", "cublas64_12.dll")) or os.path.exists(os.path.join(cuda_path, "bin", "cublas64_11.dll"))):
+                has_cublas = True
+
+        if not has_cublas:
+            logger.info("[STT DEVICE DIAGNOSTICS] cuBLAS DLLs (cublas64_12.dll) not found in system PATH. Selecting CPU for Faster-Whisper.")
+            return False
+
+        if hasattr(ctranslate2, "get_cuda_device_count"):
+            return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        pass
+    return False
+
+
 def get_verified_ffmpeg() -> Tuple[Optional[str], Optional[str]]:
     """Discovers and verifies FFmpeg executable exit code 0 and version string."""
     candidates = []
@@ -93,10 +118,64 @@ class LocalVoiceTranscription(BaseModel):
     provider: str = "local_whisper"
     engine: str = "faster-whisper"
     device: str = "CPU"
-    model: str = "tiny"
+    compute_type: str = "default"
+    model: str = "base.en"
     timestamp: float = Field(default_factory=time.time)
     error_code: Optional[str] = None
     error: Optional[str] = None
+    retryable: bool = False
+
+
+def evaluate_stt_quality(segments: list, raw_text: str, duration_ms: float) -> Tuple[bool, str, float]:
+    """Phase 4: Evaluates Whisper segment statistics for hallucinations, repetition loops, and low confidence."""
+    if not raw_text or not segments:
+        return False, "EMPTY_TRANSCRIPT", 0.0
+
+    words = raw_text.strip().split()
+    if not words:
+        return False, "NO_WORDS", 0.0
+
+    # 1. Repetition Score (e.g. "click click click click click click" or repeated phrase loops)
+    word_counts = {}
+    for w in words:
+        clean_w = w.lower().strip(".,!?")
+        word_counts[clean_w] = word_counts.get(clean_w, 0) + 1
+
+    max_repeat = max(word_counts.values()) if word_counts else 0
+    repeat_ratio = max_repeat / len(words)
+
+    if len(words) >= 4 and max_repeat >= 5 and repeat_ratio > 0.5:
+        return False, f"REPETITION_HALLUCINATION (max_repeat={max_repeat})", 0.0
+
+    # 2. Segment metrics
+    logprobs = [getattr(s, 'avg_logprob', 0.0) for s in segments if hasattr(s, 'avg_logprob')]
+    no_speech_probs = [getattr(s, 'no_speech_prob', 0.0) for s in segments if hasattr(s, 'no_speech_prob')]
+    compression_ratios = [getattr(s, 'compression_ratio', 1.0) for s in segments if hasattr(s, 'compression_ratio')]
+
+    avg_logprob = float(np.mean(logprobs)) if logprobs else -0.5
+    max_no_speech = float(np.max(no_speech_probs)) if no_speech_probs else 0.0
+    max_compression = float(np.max(compression_ratios)) if compression_ratios else 1.0
+
+    # 3. Speech density / impossible words-per-second
+    sec = duration_ms / 1000.0
+    words_per_sec = len(words) / sec if sec > 0 else 0
+
+    if words_per_sec > 8.5 and len(words) > 8:
+        return False, f"IMPOSSIBLE_SPEECH_DENSITY (wps={words_per_sec:.1f})", 0.0
+
+    if max_compression > 2.6:
+        return False, f"EXCESSIVE_COMPRESSION_RATIO (ratio={max_compression:.2f})", 0.0
+
+    if avg_logprob < -1.4:
+        return False, f"LOW_AVERAGE_LOGPROB (logprob={avg_logprob:.2f})", 0.0
+
+    if max_no_speech > 0.75:
+        return False, f"HIGH_NO_SPEECH_PROB (no_speech={max_no_speech:.2f})", 0.0
+
+    conf = float(np.exp(max(-2.0, avg_logprob))) * (1.0 - (max_no_speech * 0.5))
+    conf = max(0.1, min(0.99, conf))
+
+    return True, "PASSED", conf
 
 
 class LocalWhisperSTTProvider:
@@ -105,9 +184,14 @@ class LocalWhisperSTTProvider:
     _instance: Optional["LocalWhisperSTTProvider"] = None
 
     def __init__(self):
-        self.engine = settings.JARVIS_STT_ENGINE
-        self.model_name = settings.JARVIS_STT_MODEL or "tiny"
+        self.engine = getattr(settings, "JARVIS_STT_ENGINE", "faster-whisper")
+        self.model_name = getattr(settings, "JARVIS_STT_MODEL", "base.en")
+        self.requested_device = getattr(settings, "JARVIS_STT_DEVICE", "auto").lower()
+        self.requested_compute = getattr(settings, "JARVIS_STT_COMPUTE_TYPE", "auto").lower()
+        
         self.device = "CPU"
+        self.compute_type = "default"
+        self.cuda_available = False
 
         self.ffmpeg_path: Optional[str] = None
         self.ffmpeg_version: Optional[str] = None
@@ -118,6 +202,7 @@ class LocalWhisperSTTProvider:
         self.whisper_model: Optional[Any] = None
         self.initialized = False
         self.initialization_error: Optional[str] = None
+        self.load_time_ms = 0.0
 
         self.initialize()
 
@@ -133,7 +218,6 @@ class LocalWhisperSTTProvider:
 
     @property
     def ready(self) -> bool:
-        """One authoritative readiness property: ready=True ONLY IF FFmpeg verified AND model loaded AND selftest passed."""
         return bool(
             self.ffmpeg_available
             and self.model_loaded
@@ -143,11 +227,9 @@ class LocalWhisperSTTProvider:
 
     @property
     def is_ready(self) -> bool:
-        """Alias for property ready."""
         return self.ready
 
     def initialize(self) -> None:
-        """Explicit startup initialization method with detailed error capture and diagnostic logging."""
         if self.initialized and self.ready:
             return
 
@@ -156,6 +238,7 @@ class LocalWhisperSTTProvider:
         logger.info(f"[LOCAL STT LIFESPAN] pid={pid} ppid={ppid} initialize_called=true provider_id={hex(id(self))}")
 
         self.initialization_error = None
+        self.cuda_available = check_cuda_available()
 
         try:
             # 1. Discover and verify FFmpeg binary
@@ -170,23 +253,18 @@ class LocalWhisperSTTProvider:
             # 2. Load resident Faster-Whisper model into memory
             self._load_resident_model()
 
-            # 3. Perform startup self-test inference
-            self._run_startup_selftest()
-
             self.initialized = True
 
             logger.info(
-                f"[LOCAL STT STARTUP DEBUG] pid={pid} "
-                f"provider_id={hex(id(self))} "
+                f"[STT STARTUP DIAGNOSTICS] pid={pid} "
+                f"model='{self.model_name}' "
+                f"actual_device='{self.device}' "
+                f"compute_type='{self.compute_type}' "
+                f"cuda_available={self.cuda_available} "
+                f"load_time_ms={self.load_time_ms:.1f}ms "
                 f"ffmpeg_available={self.ffmpeg_available} "
-                f"ffmpeg_path='{self.ffmpeg_path}' "
-                f"ffmpeg_version='{self.ffmpeg_version}' "
-                f"model_name='{self.model_name}' "
-                f"model_loaded={self.model_loaded} "
-                f"whisper_model_is_none={self.whisper_model is None} "
                 f"selftest_passed={self.selftest_passed} "
-                f"ready={self.ready} "
-                f"initialization_error='{self.initialization_error or 'None'}'"
+                f"ready={self.ready}"
             )
 
         except Exception as unhandled_err:
@@ -197,8 +275,9 @@ class LocalWhisperSTTProvider:
             self.selftest_passed = False
 
     def _load_resident_model(self) -> None:
-        """Loads Faster-Whisper model into memory once."""
+        """Loads Faster-Whisper model into memory with automatic CUDA -> CPU fallback."""
         pid = os.getpid()
+        t0 = time.time()
 
         if not HAS_FASTER_WHISPER:
             err_msg = f"faster_whisper package import failed: {FASTER_WHISPER_IMPORT_ERROR or 'ImportError'}"
@@ -208,60 +287,60 @@ class LocalWhisperSTTProvider:
             self.whisper_model = None
             return
 
-        if settings.JARVIS_STT_DEVICE == "cuda":
+        should_try_cuda = (self.requested_device in ["cuda", "auto"]) and self.cuda_available
+
+        if should_try_cuda:
+            c_type = "float16" if self.requested_compute in ["auto", "float16"] else self.requested_compute
             try:
-                logger.info(f"[LOCAL STT MODEL] pid={pid} model='{self.model_name}' device='CUDA' compute_type='float16' loading=true...")
-                self.whisper_model = WhisperModel(self.model_name, device="cuda", compute_type="float16")
+                logger.info(f"[LOCAL STT MODEL] pid={pid} model='{self.model_name}' device='CUDA' compute_type='{c_type}' loading=true...")
+                model = WhisperModel(self.model_name, device="cuda", compute_type=c_type)
+                
+                # Test CUDA inference with synthetic PCM
+                sample_rate = 16000
+                t = np.linspace(0, 0.3, int(sample_rate * 0.3), False)
+                synthetic_pcm = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+                segments, _ = model.transcribe(synthetic_pcm, language="en", vad_filter=False)
+                _ = list(segments)
+
+                self.whisper_model = model
                 self.device = "CUDA"
+                self.compute_type = c_type
                 self.model_loaded = True
-                logger.info(f"[LOCAL STT MODEL] pid={pid} loaded=true object_present=true device='CUDA'")
+                self.selftest_passed = True
+                self.load_time_ms = (time.time() - t0) * 1000.0
+                logger.info(f"[LOCAL STT MODEL SUCCESS] pid={pid} loaded=true device='CUDA' compute_type='{c_type}' load_time={self.load_time_ms:.1f}ms")
                 return
             except Exception as cuda_err:
-                logger.warning(f"[LOCAL STT MODEL] CUDA load warning: {cuda_err}")
+                logger.warning(f"[LOCAL STT MODEL CUDA FALLBACK] CUDA load/selftest attempt failed ({cuda_err}). Falling back to CPU...")
 
+        # CPU Fallback (using compute_type="default")
+        cpu_c_type = "default" if self.requested_compute in ["auto", "default"] else self.requested_compute
         try:
-            logger.info(f"[LOCAL STT MODEL] pid={pid} model='{self.model_name}' device='CPU' compute_type='int8' loading=true...")
-            self.whisper_model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+            logger.info(f"[LOCAL STT MODEL] pid={pid} model='{self.model_name}' device='CPU' compute_type='{cpu_c_type}' loading=true...")
+            model = WhisperModel(self.model_name, device="cpu", compute_type=cpu_c_type)
+
+            sample_rate = 16000
+            t = np.linspace(0, 0.3, int(sample_rate * 0.3), False)
+            synthetic_pcm = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+            segments, _ = model.transcribe(synthetic_pcm, language="en", vad_filter=False)
+            _ = list(segments)
+
+            self.whisper_model = model
             self.device = "CPU"
+            self.compute_type = cpu_c_type
             self.model_loaded = True
-            logger.info(f"[LOCAL STT MODEL] pid={pid} loaded=true object_present=true device='CPU'")
+            self.selftest_passed = True
+            self.load_time_ms = (time.time() - t0) * 1000.0
+            logger.info(f"[LOCAL STT MODEL SUCCESS] pid={pid} loaded=true device='CPU' compute_type='{cpu_c_type}' load_time={self.load_time_ms:.1f}ms")
         except Exception as cpu_err:
             tb_str = traceback.format_exc()
             self.initialization_error = f"Faster-Whisper CPU load failed: {repr(cpu_err)}"
-            logger.error(f"[LOCAL STT MODEL] pid={pid} loaded=false object_present=false initialization_error='{repr(cpu_err)}'\n{tb_str}")
+            logger.error(f"[LOCAL STT MODEL FAILURE] pid={pid} loaded=false initialization_error='{repr(cpu_err)}'\n{tb_str}")
             self.model_loaded = False
             self.whisper_model = None
-
-    def _run_startup_selftest(self) -> None:
-        """Runs a tiny 0.5s synthetic PCM self-test inference through Faster-Whisper to verify model inference functions cleanly."""
-        pid = os.getpid()
-        if not self.model_loaded or not self.whisper_model:
             self.selftest_passed = False
-            if not self.initialization_error:
-                self.initialization_error = "Model not loaded prior to self-test"
-            return
-
-        try:
-            logger.info(f"[LOCAL STT SELF TEST] pid={pid} started=true")
-            t0 = time.time()
-            sample_rate = 16000
-            t = np.linspace(0, 0.5, int(sample_rate * 0.5), False)
-            synthetic_pcm = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-
-            segments, _ = self.whisper_model.transcribe(synthetic_pcm, language="en", vad_filter=False)
-            _ = list(segments)
-            infer_ms = (time.time() - t0) * 1000.0
-            self.selftest_passed = True
-            logger.info(f"[LOCAL STT SELF TEST] pid={pid} completed=true inference_ms={infer_ms:.1f}ms status=PASSED")
-        except Exception as selftest_err:
-            tb_str = traceback.format_exc()
-            self.initialization_error = f"Startup selftest failed: {repr(selftest_err)}"
-            logger.error(f"[LOCAL STT SELF TEST FAILURE] pid={pid} error={selftest_err}\n{tb_str}")
-            self.selftest_passed = False
-            self.model_loaded = False
 
     def _decode_audio_with_ffmpeg(self, audio_bytes: bytes, filename: str) -> Tuple[np.ndarray, float, float, float, float, Optional[str]]:
-        """Decodes WebM/Opus/WAV audio bytes using verified FFmpeg into 16,000 Hz mono S16LE Float32 PCM array."""
         t_start = time.time()
         ffmpeg_exe = self.ffmpeg_path
         pid = os.getpid()
@@ -305,7 +384,7 @@ class LocalWhisperSTTProvider:
             if proc.returncode != 0 or not stdout:
                 err_msg = stderr.decode('utf-8', errors='ignore') if stderr else "FFmpeg process failed."
                 logger.error(f"[AUDIO DECODE] pid={pid} FFmpeg conversion failed (returncode={proc.returncode}): {err_msg[:200]}")
-                return np.array([], dtype=np.float32), 0.0, 0.0, 0.0, decode_ms, err_msg
+                return np.array([], dtype=np.float32), 0.0, 0.0, 0.0, decode_ms, f"EBML header / FFmpeg decode failure: {err_msg[:120]}"
 
             pcm_int16 = np.frombuffer(stdout, dtype=np.int16)
             if len(pcm_int16) == 0:
@@ -335,14 +414,27 @@ class LocalWhisperSTTProvider:
         audio_bytes: bytes,
         filename: str = "speech.webm",
         content_type: str = "audio/webm",
+        capture_id: Optional[str] = None,
     ) -> LocalVoiceTranscription:
-        """Transcribes microphone audio locally using verified FFmpeg PCM conversion and resident Faster-Whisper model."""
         t_start = time.time()
         pid = os.getpid()
-        logger.info(f"[VOICE] pid={pid} provider=local_whisper audio_bytes={len(audio_bytes)} filename='{filename}' content_type='{content_type}'")
+        cid = capture_id or f"cap_{int(t_start*1000)}"
+
+        logger.info(f"[STT] pid={pid} capture_id='{cid}' provider=local_whisper audio_bytes={len(audio_bytes) if audio_bytes else 0} filename='{filename}' content_type='{content_type}'")
+
+        if not audio_bytes or len(audio_bytes) < 300:
+            logger.warning(f"[STT] pid={pid} capture_id='{cid}' Audio file empty or below minimum valid threshold ({len(audio_bytes) if audio_bytes else 0} bytes).")
+            return LocalVoiceTranscription(
+                text="",
+                error_code="AUDIO_INVALID",
+                error="Audio recording payload is incomplete or below valid threshold.",
+                retryable=True,
+                confidence=0.0,
+                total_ms=(time.time() - t_start) * 1000.0,
+            )
 
         if not self.ffmpeg_available:
-            logger.error(f"[VOICE] pid={pid} STT Unavailable: FFmpeg binary is missing or unverified.")
+            logger.error(f"[STT] pid={pid} capture_id='{cid}' STT Unavailable: FFmpeg binary is missing or unverified.")
             return LocalVoiceTranscription(
                 text="",
                 error_code="FFMPEG_MISSING",
@@ -352,7 +444,7 @@ class LocalWhisperSTTProvider:
             )
 
         if not self.ready:
-            logger.error(f"[VOICE] pid={pid} STT Unavailable: Local STT provider is not ready. detail='{self.initialization_error or 'Unknown'}'")
+            logger.error(f"[STT] pid={pid} capture_id='{cid}' STT Unavailable: Local STT provider is not ready. detail='{self.initialization_error or 'Unknown'}'")
             return LocalVoiceTranscription(
                 text="",
                 error_code="STT_MODEL_NOT_READY",
@@ -361,31 +453,22 @@ class LocalWhisperSTTProvider:
                 total_ms=(time.time() - t_start) * 1000.0,
             )
 
-        if not audio_bytes or len(audio_bytes) < 100:
-            logger.warning(f"[VOICE] pid={pid} Audio file empty or below minimum size (100 bytes).")
-            return LocalVoiceTranscription(
-                text="",
-                error_code="AUDIO_EMPTY",
-                error="Audio input is empty or corrupt.",
-                confidence=0.0,
-                total_ms=(time.time() - t_start) * 1000.0,
-            )
-
         pcm, duration_ms, rms, peak, decode_ms, err = self._decode_audio_with_ffmpeg(audio_bytes, filename)
 
         if len(pcm) == 0:
-            logger.error(f"[AUDIO DECODE] pid={pid} Failed to decode PCM: {err}")
+            logger.error(f"[AUDIO DECODE] pid={pid} capture_id='{cid}' Failed to decode PCM: {err}")
             return LocalVoiceTranscription(
                 text="",
-                error_code="AUDIO_DECODE_FAILED",
+                error_code="AUDIO_INVALID",
                 error=err or "FFmpeg failed to decode audio samples.",
+                retryable=True,
                 confidence=0.0,
                 decode_ms=decode_ms,
                 total_ms=(time.time() - t_start) * 1000.0,
             )
 
-        if rms < 0.001 or duration_ms < 150.0:
-            logger.info(f"[AUDIO] pid={pid} output_samples={len(pcm)} rms={rms:.4f} peak={peak:.4f} speech_present=false")
+        if rms < 0.0015 or duration_ms < 150.0:
+            logger.info(f"[AUDIO] pid={pid} capture_id='{cid}' output_samples={len(pcm)} rms={rms:.4f} peak={peak:.4f} speech_present=false")
             return LocalVoiceTranscription(
                 text="",
                 error_code="AUDIO_SILENT",
@@ -397,24 +480,24 @@ class LocalWhisperSTTProvider:
                 provider="local_whisper",
                 engine=self.engine,
                 device=self.device,
+                compute_type=self.compute_type,
                 model=self.model_name,
             )
 
-        logger.info(f"[AUDIO] pid={pid} output_samples={len(pcm)} rms={rms:.4f} peak={peak:.4f} speech_present=true")
+        logger.info(f"[AUDIO] pid={pid} capture_id='{cid}' output_samples={len(pcm)} rms={rms:.4f} peak={peak:.4f} speech_present=true")
 
         t_infer_start = time.time()
 
         initial_prompt = (
-            "JARVIS Notepad Chrome Google Chrome YouTube Spotify WhatsApp Settings "
-            "VS Code Visual Studio Code File Explorer Task Manager Calculator PowerPoint Word Excel "
-            "open close launch start stop type search play pause resume"
+            "JARVIS, Notepad, Chrome, Google Chrome, Visual Studio Code, VS Code, "
+            "YouTube, Spotify, WhatsApp, open, close, launch, click, type, "
+            "search, play, pause, stop, cancel"
         )
-        vad_params = dict(min_silence_duration_ms=500, speech_pad_ms=400)
+        vad_params = dict(min_silence_duration_ms=450, speech_pad_ms=350)
 
         logger.info(
-            f"[STT CONFIG] pid={pid} model='{self.model_name}' device='{self.device}' "
-            f"language='en' beam_size=5 vad_filter=True condition_on_previous_text=False "
-            f"initial_prompt='{initial_prompt[:60]}...'"
+            f"[STT CONFIG] pid={pid} capture_id='{cid}' model='{self.model_name}' device='{self.device}' "
+            f"compute_type='{self.compute_type}' language='en' beam_size=5 vad_filter=True condition_on_previous_text=False"
         )
 
         try:
@@ -422,6 +505,7 @@ class LocalWhisperSTTProvider:
                 pcm,
                 beam_size=5,
                 language="en",
+                temperature=0.0,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,
@@ -431,29 +515,44 @@ class LocalWhisperSTTProvider:
             segment_texts = [seg.text.strip() for seg in segments if seg.text.strip()]
             raw_text = " ".join(segment_texts).strip()
 
-            lang_prob = getattr(info, "language_probability", 1.0)
-            logger.info(
-                f"[STT RESULT] raw_text='{raw_text}' language='{getattr(info, 'language', 'en')}' "
-                f"language_probability={lang_prob:.2f} segments={len(segment_texts)}"
-            )
+            inference_ms = (time.time() - t_infer_start) * 1000.0
 
-            # Apply conservative command normalization (e.g. "open not bad" -> "Open Notepad.")
+            # Phase 4: Evaluate STT quality statistics & hallucination guard
+            is_acceptable, quality_reason, conf_score = evaluate_stt_quality(segments, raw_text, duration_ms)
+
+            if not is_acceptable:
+                logger.warning(f"[STT QUALITY REJECTED] pid={pid} capture_id='{cid}' reason='{quality_reason}' raw_text='{raw_text}'")
+                return LocalVoiceTranscription(
+                    text="I didn't catch that clearly. Please repeat.",
+                    error_code="STT_UNCERTAIN",
+                    error=f"STT quality check failed: {quality_reason}",
+                    confidence=0.0,
+                    duration_ms=duration_ms,
+                    decode_ms=decode_ms,
+                    inference_ms=inference_ms,
+                    total_ms=(time.time() - t_start) * 1000.0,
+                    provider="local_whisper",
+                    engine=self.engine,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    model=self.model_name,
+                )
+
+            # Apply command normalization (wake-word stripping & application alias mapping)
             from app.voice.normalization import normalize_voice_command
             normalized_text, norm_rule = normalize_voice_command(raw_text)
 
-            inference_ms = (time.time() - t_infer_start) * 1000.0
             t_post = time.time()
-
             postprocess_ms = (time.time() - t_post) * 1000.0
             total_ms = (time.time() - t_start) * 1000.0
 
-            logger.info(f"[LOCAL STT] pid={pid} inference_completed=true decode_ms={decode_ms:.1f}ms inference_ms={inference_ms:.1f}ms postprocess_ms={postprocess_ms:.1f}ms total_ms={total_ms:.1f}ms")
-            logger.info(f"[LOCAL STT] pid={pid} segments={len(segment_texts)} raw_text='{raw_text}' final_text='{normalized_text}' norm_rule='{norm_rule or 'none'}'")
+            logger.info(f"[STT PERFORMANCE] pid={pid} capture_id='{cid}' decode_ms={decode_ms:.1f}ms inference_ms={inference_ms:.1f}ms total_ms={total_ms:.1f}ms confidence={conf_score:.2f}")
+            logger.info(f"[STT RESULT] pid={pid} capture_id='{cid}' raw_text='{raw_text}' final_text='{normalized_text}' norm_rule='{norm_rule or 'none'}'")
 
             return LocalVoiceTranscription(
                 text=normalized_text,
                 language=getattr(info, "language", "en"),
-                confidence=0.98 if normalized_text else 0.0,
+                confidence=conf_score if normalized_text else 0.0,
                 duration_ms=duration_ms,
                 decode_ms=decode_ms,
                 inference_ms=inference_ms,
@@ -462,11 +561,12 @@ class LocalWhisperSTTProvider:
                 provider="local_whisper",
                 engine=self.engine,
                 device=self.device,
+                compute_type=self.compute_type,
                 model=self.model_name,
             )
 
         except Exception as whisper_err:
-            logger.error(f"[LOCAL STT] pid={pid} Faster-Whisper inference failure: {whisper_err}", exc_info=True)
+            logger.error(f"[STT INFERENCE EXCEPTION] pid={pid} capture_id='{cid}' error={whisper_err}", exc_info=True)
             return LocalVoiceTranscription(
                 text="",
                 error_code="STT_INFERENCE_FAILED",
@@ -484,10 +584,12 @@ class LocalWhisperSTTProvider:
             "available": self.ready,
             "engine": self.engine,
             "device": self.device,
+            "compute_type": self.compute_type,
+            "cuda_available": self.cuda_available,
             "model": self.model_name,
             "model_loaded": self.model_loaded,
             "selftest_passed": self.selftest_passed,
-            "resident": self.model_loaded,
+            "load_time_ms": self.load_time_ms,
             "ready": self.ready,
             "ffmpeg_available": self.ffmpeg_available,
             "ffmpeg_path": self.ffmpeg_path,

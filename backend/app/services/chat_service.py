@@ -1,4 +1,5 @@
 import re
+import asyncio
 from typing import Optional, Dict, Any, AsyncGenerator, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.agent import JARVISAgent
@@ -111,6 +112,7 @@ class ChatService:
         user_message: str,
         conversation_id: Optional[str] = None,
         channel: str = "chat",
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Handles chat request streaming real-time tokens."""
         conversation = await self.conversation_manager.get_or_create_conversation(db, conversation_id)
