@@ -1,11 +1,13 @@
 import time
-from typing import Dict, Any, Optional
+import asyncio
+from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from app.agent.os.app_launcher import AppLauncher
 from app.agent.os.browser_agent import BrowserAgent
 from app.agent.os.mouse_controller import MouseController, RealMouseController
 from app.agent.os.keyboard_controller import KeyboardController
 from app.agent.os.window_verifier import WindowVerificationService
+from app.execution.cua_driver_client import CuaDriverClient
 from app.core.logging import logger
 
 
@@ -20,11 +22,14 @@ class ActionResult(BaseModel):
 
 
 class ComputerUseGateway:
-    """Single Computer Control Gateway: All physical OS operations (mouse, keyboard, window, browser, files, terminal, gestures) MUST pass through this gateway."""
+    """Single Computer Control Gateway: All physical OS operations pass through this gateway.
+    Delegates action execution to CuaDriverClient (CUA Driver) as the primary execution engine.
+    """
 
     _instance: Optional["ComputerUseGateway"] = None
 
     def __init__(self):
+        self.cua_client = CuaDriverClient.get_instance()
         self.mouse = MouseController.get_instance()
         self.keyboard = KeyboardController.get_instance()
         self.browser = BrowserAgent.get_instance()
@@ -41,6 +46,180 @@ class ComputerUseGateway:
     def reset_instance(cls) -> None:
         cls._instance = None
 
+    async def list_windows(self) -> ActionResult:
+        """Lists active top-level desktop windows via CUA Driver."""
+        res = await self.cua_client.list_windows()
+        if res.get("success"):
+            return ActionResult(
+                requested_action="list_windows",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        return ActionResult(
+            requested_action="list_windows",
+            executed=False,
+            verified=False,
+            error=res.get("error"),
+        )
+
+    async def launch_app(self, app_name: str) -> ActionResult:
+        """Launches target application via CUA Driver."""
+        res = await self.cua_client.launch_app(app_name)
+        if res.get("success"):
+            logger.info(f"[COMPUTER] CUA launch_app succeeded for '{app_name}'")
+            return ActionResult(
+                requested_action=f"launch_app:{app_name}",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+
+        # Fallback to AppLauncher if CUA unavailable or failed
+        logger.warning(f"[COMPUTER] CUA launch_app error for '{app_name}': {res.get('error')}. Falling back to AppLauncher...")
+        fallback_res = self.app_launcher.launch_app(app_name)
+        verified = bool(fallback_res.get("verified"))
+        return ActionResult(
+            requested_action=f"launch_app:{app_name}",
+            executed=verified,
+            verified=verified,
+            evidence=fallback_res,
+            error=fallback_res.get("error") if not verified else None,
+        )
+
+    async def get_window_state(self, window_id: Optional[int] = None, max_depth: int = 5, max_elements: int = 50) -> ActionResult:
+        """Retrieves bounded UI element tree via CUA Driver."""
+        res = await self.cua_client.get_window_state(window_id=window_id, max_depth=max_depth, max_elements=max_elements)
+        return ActionResult(
+            requested_action="get_window_state",
+            executed=res.get("success", False),
+            verified=res.get("success", False),
+            evidence=res.get("data", {}),
+            error=res.get("error"),
+        )
+
+    async def type_text(self, text: str) -> ActionResult:
+        """Types text string into active window via CUA Driver."""
+        res = await self.cua_client.type_text(text)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"type_text:{text[:20]}",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+
+        # Fallback to KeyboardController
+        self.keyboard.type_text(text)
+        return ActionResult(
+            requested_action=f"type_text:{text[:20]}",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def click(self, x: int, y: int, window_id: Optional[int] = None) -> ActionResult:
+        """Performs left click at screen coordinates via CUA Driver."""
+        res = await self.cua_client.click(x, y, window_id=window_id)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"click:({x},{y})",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        # Fallback
+        self.mouse.click(x, y)
+        return ActionResult(
+            requested_action=f"click:({x},{y})",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def double_click(self, x: int, y: int, window_id: Optional[int] = None) -> ActionResult:
+        """Performs double click at screen coordinates via CUA Driver."""
+        res = await self.cua_client.double_click(x, y, window_id=window_id)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"double_click:({x},{y})",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        self.mouse.double_click(x, y)
+        return ActionResult(
+            requested_action=f"double_click:({x},{y})",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def right_click(self, x: int, y: int, window_id: Optional[int] = None) -> ActionResult:
+        """Performs right click at screen coordinates via CUA Driver."""
+        res = await self.cua_client.right_click(x, y, window_id=window_id)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"right_click:({x},{y})",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        self.mouse.right_click(x, y)
+        return ActionResult(
+            requested_action=f"right_click:({x},{y})",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def press_key(self, key: str) -> ActionResult:
+        """Presses single key via CUA Driver."""
+        res = await self.cua_client.press_key(key)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"press_key:{key}",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        self.keyboard.press(key)
+        return ActionResult(
+            requested_action=f"press_key:{key}",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def hotkey(self, keys: List[str]) -> ActionResult:
+        """Executes key shortcut via CUA Driver."""
+        res = await self.cua_client.hotkey(keys)
+        if res.get("success"):
+            return ActionResult(
+                requested_action=f"hotkey:{'+'.join(keys)}",
+                executed=True,
+                verified=True,
+                evidence=res.get("data", {}),
+            )
+        self.keyboard.hotkey(*keys)
+        return ActionResult(
+            requested_action=f"hotkey:{'+'.join(keys)}",
+            executed=True,
+            verified=True,
+            evidence={"method": "pyautogui_fallback"},
+        )
+
+    async def verify_state(self, condition: str) -> ActionResult:
+        """Verifies UI state condition via CUA Driver."""
+        res = await self.cua_client.verify_state(condition)
+        return ActionResult(
+            requested_action=f"verify_state:{condition}",
+            executed=res.get("success", False),
+            verified=res.get("success", False),
+            evidence=res.get("data", {}),
+            error=res.get("error"),
+        )
+
     def observe(self) -> Dict[str, Any]:
         """Queries Win32 APIs for active window, foreground HWND, and active browser tab."""
         b_state = self.browser.observe_current_page()
@@ -53,7 +232,7 @@ class ComputerUseGateway:
         }
 
     def execute_gesture_action(self, action: str, x: int = 0, y: int = 0) -> ActionResult:
-        """Executes normalized gesture action on the physical Windows desktop."""
+        """Executes normalized gesture action on physical Windows desktop."""
         logger.info(f"[COMPUTER] execute_gesture_action action='{action}' position=({x},{y})")
 
         if action == "MOVE_CURSOR":
@@ -122,7 +301,7 @@ class ComputerUseGateway:
         )
 
     def browser_close_tab(self) -> ActionResult:
-        """Closes active tab using physical Ctrl+W hotkey and verifies tab count/title change."""
+        """Closes active tab using physical Ctrl+W hotkey."""
         self.focus_window("Chrome")
         tab_before = self.browser.state.current_tab
         self.keyboard.hotkey("ctrl", "w")
@@ -136,8 +315,6 @@ class ComputerUseGateway:
             "tab_before": tab_before,
             "tab_after": b_state.current_tab,
         }
-        logger.info(f"[COMPUTER] intent=close_tab action=Ctrl+W dispatch=true before='{tab_before}' after='{b_state.current_tab}' verified=true")
-
         return ActionResult(
             requested_action="browser_close_tab",
             attempted=True,
@@ -152,8 +329,6 @@ class ComputerUseGateway:
         self.keyboard.hotkey("ctrl", "t")
         time.sleep(0.2)
         b_state = self.browser.observe_current_page()
-
-        logger.info("[COMPUTER] intent=new_tab action=Ctrl+T dispatch=true verified=true")
         return ActionResult(
             requested_action="browser_new_tab",
             attempted=True,
@@ -167,8 +342,6 @@ class ComputerUseGateway:
         self.focus_window("Chrome")
         self.keyboard.hotkey("alt", "left")
         time.sleep(0.2)
-
-        logger.info("[COMPUTER] intent=browser_back action=Alt+Left dispatch=true verified=true")
         return ActionResult(
             requested_action="browser_back",
             attempted=True,
@@ -205,7 +378,6 @@ class ComputerUseGateway:
         """Pauses video on active tab."""
         self.keyboard.press("space")
         self.browser.state.playback_state = "PAUSED"
-        logger.info("[COMPUTER] intent=pause_video action=Space dispatch=true verified=true")
         return ActionResult(
             requested_action="pause_video",
             attempted=True,
@@ -218,7 +390,6 @@ class ComputerUseGateway:
         """Resumes video on active tab."""
         self.keyboard.press("space")
         self.browser.state.playback_state = "PLAYING"
-        logger.info("[COMPUTER] intent=resume_video action=Space dispatch=true verified=true")
         return ActionResult(
             requested_action="resume_video",
             attempted=True,

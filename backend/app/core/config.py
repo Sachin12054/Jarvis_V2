@@ -34,8 +34,8 @@ class Settings(BaseSettings):
     # LLM Settings
     LLM_PROVIDER: str = Field(default="ollama", description="Provider: mock, openai, gemini, ollama")
     LLM_API_KEY: Optional[str] = Field(default=None, description="API Key for the chosen provider")
-    LLM_MODEL: str = Field(default="deepseek-r1-7b:latest", description="Model identifier")
-    LLM_TIMEOUT: float = Field(default=30.0, description="Timeout in seconds for LLM calls")
+    LLM_MODEL: str = Field(default="qwen3-test:latest", description="Model identifier")
+    LLM_TIMEOUT: float = Field(default=60.0, description="Timeout in seconds for LLM calls")
 
     # Local Whisper Speech-to-Text (STT) Settings
     JARVIS_STT_PROVIDER: str = Field(default="local_whisper", description="STT Provider: local_whisper")
@@ -57,9 +57,18 @@ class Settings(BaseSettings):
     ELEVENLABS_TTS_MODEL: str = Field(default="eleven_multilingual_v2", description="TTS model for ElevenLabs")
     ELEVENLABS_TIMEOUT: float = Field(default=15.0, description="Timeout in seconds for ElevenLabs API calls")
 
+    # CUA Driver Settings
+    CUA_DRIVER_PATH: str = Field(
+        default=r"C:\Users\sachi\AppData\Local\Programs\Cua\cua-driver\bin\cua-driver.exe",
+        description="Path to CUA Driver binary",
+    )
+    CUA_SOCKET_PIPE: str = Field(default=r"\\.\pipe\cua-driver", description="CUA Driver socket pipe endpoint")
+    CUA_DRIVER_TIMEOUT: float = Field(default=15.0, description="Timeout for CUA Driver tool execution")
+
     # Ollama Local Settings & Explicit Timeouts
-    OLLAMA_BASE_URL: str = Field(default="http://127.0.0.1:11434", description="Ollama local HTTP API base URL")
-    OLLAMA_MODEL: str = Field(default="deepseek-r1-7b:latest", description="Default Ollama model")
+    OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", description="Ollama local HTTP API base URL")
+    OLLAMA_MODEL: str = Field(default="qwen3-test:latest", description="Default Ollama reasoning model")
+    OLLAMA_CONTEXT_LENGTH: int = Field(default=16384, description="Context window size in tokens")
     OLLAMA_CODING_MODEL: str = Field(default="qwen-coder-3b:latest", description="Ollama coding model")
     OLLAMA_FAST_MODEL: str = Field(default="gemma-3-4b:latest", description="Ollama fast model")
     OLLAMA_TIMEOUT: float = Field(default=300.0, description="Ollama overall timeout in seconds")

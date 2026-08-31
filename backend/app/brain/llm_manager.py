@@ -179,6 +179,9 @@ class OllamaLLMProvider(LLMProvider):
             "model": selected_model,
             "messages": messages,
             "stream": False,
+            "options": {
+                "num_ctx": getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
+            },
         }
 
         try:
@@ -218,6 +221,9 @@ class OllamaLLMProvider(LLMProvider):
             "model": selected_model,
             "messages": messages,
             "stream": True,
+            "options": {
+                "num_ctx": getattr(settings, "OLLAMA_CONTEXT_LENGTH", 16384)
+            },
             "keep_alive": "10m",
         }
 
