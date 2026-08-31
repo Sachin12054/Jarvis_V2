@@ -327,6 +327,41 @@ export class VoiceRecognitionService {
     }
   }
 
+  private audioQueue: Array<{ b64Data: string; text: string }> = [];
+  private isPlayingQueue = false;
+
+  private async enqueueAndPlayAudioChunk(b64Data: string, text: string, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
+    this.audioQueue.push({ b64Data, text });
+    if (!this.isPlayingQueue) {
+      this.playNextInQueue(callbacks, activeConversationId);
+    }
+  }
+
+  private async playNextInQueue(callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
+    if (this.audioQueue.length === 0) {
+      this.isPlayingQueue = false;
+      this.isSpeaking = false;
+      this.isProcessing = false;
+      if (this.isVoiceModeActive) {
+        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
+      } else {
+        callbacks.onStateChange('idle');
+      }
+      return;
+    }
+
+    this.isPlayingQueue = true;
+    const item = this.audioQueue.shift()!;
+
+    if (!this.isVoiceModeActive && !this.isSpeaking && !this.isPlayingQueue) {
+      this.audioQueue = [];
+      return;
+    }
+
+    await this.playAudioBase64(item.b64Data, callbacks, activeConversationId);
+    this.playNextInQueue(callbacks, activeConversationId);
+  }
+
   private async processAudioTurn(audioBlob: Blob, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
     try {
       const formData = new FormData();
@@ -335,95 +370,106 @@ export class VoiceRecognitionService {
         formData.append('conversation_id', activeConversationId);
       }
 
-      console.log(`[VOICE CAPTURE] Uploading turn audio (${audioBlob.size} bytes)...`);
+      console.log(`[VOICE STREAM] Uploading turn audio (${audioBlob.size} bytes)...`);
+      const response = await fetch('/api/v1/voice/stream', {
+        method: 'POST',
+        body: formData,
+      });
+
+      this.turnTimings.sttDone = Date.now();
+
+      if (!response.ok || !response.body) {
+        console.warn('[VOICE STREAM] Stream endpoint returned non-OK status. Falling back to default transcribe.');
+        return this.processAudioTurnFallback(audioBlob, callbacks, activeConversationId);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let accumulatedText = '';
+      let currentTranscript = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const cleanLine = line.replace(/^data:\s*/, '').trim();
+          if (!cleanLine) continue;
+
+          try {
+            const event = JSON.parse(cleanLine);
+            if (event.type === 'transcript') {
+              currentTranscript = event.text || '';
+              if (currentTranscript && callbacks.onTranscript) {
+                callbacks.onTranscript(currentTranscript);
+              }
+            } else if (event.type === 'text_delta') {
+              accumulatedText += event.text;
+              callbacks.onStateChange('speaking');
+              if (callbacks.onAgentResponse) {
+                callbacks.onAgentResponse(currentTranscript, accumulatedText, activeConversationId || undefined, 'qwen3-test:latest');
+              }
+            } else if (event.type === 'audio_chunk') {
+              if (this.isVoiceModeActive || this.isProcessing) {
+                await this.enqueueAndPlayAudioChunk(event.audio_b64, event.text, callbacks, activeConversationId);
+              }
+            } else if (event.type === 'done') {
+              console.log(`[VOICE STREAM] Turn completed total_ms=${event.total_ms || 0}ms`);
+            }
+          } catch (e) {
+            console.warn('[VOICE STREAM] Event parse error:', e);
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error('[VOICE STREAM] Turn processing error:', err);
+      this.isProcessing = false;
+      callbacks.onStateChange('error');
+      if (callbacks.onError) callbacks.onError(err.message || 'Error processing streaming audio turn.');
+      if (this.isVoiceModeActive) {
+        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1000);
+      }
+    }
+  }
+
+  private async processAudioTurnFallback(audioBlob: Blob, callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
+    try {
+      const formData = new FormData();
+      formData.append('file', audioBlob, 'speech.webm');
+      if (activeConversationId) {
+        formData.append('conversation_id', activeConversationId);
+      }
+
       const response = await fetch('/api/v1/voice/transcribe', {
         method: 'POST',
         body: formData,
       });
 
-      console.log(`[VOICE CAPTURE] Server response status=${response.status}`);
-      this.turnTimings.sttDone = Date.now();
-
       if (response.ok) {
         const data = await response.json();
+        const transcript = data?.transcription?.text || '';
+        const agentReply = data?.agent_response?.message || '';
 
-        // Handle STT Infrastructure Error response
-        if (data?.success === false) {
-          const errDetail = data?.message || 'Speech recognition unavailable.';
-          console.warn(`[VoiceV3] STT Infrastructure Error: ${data?.error_type} - ${errDetail}`);
-          this.isProcessing = false;
-          callbacks.onStateChange('error');
-          if (callbacks.onError) callbacks.onError(`Speech Error (${data?.error_type}): ${errDetail}`);
-          if (callbacks.onTTSStatus) callbacks.onTTSStatus(`STT Error: ${data?.error_type}`);
-          if (this.isVoiceModeActive) {
-            setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1500);
-          }
-          return;
-        }
+        if (transcript && callbacks.onTranscript) callbacks.onTranscript(transcript);
+        if (agentReply && callbacks.onAgentResponse) callbacks.onAgentResponse(transcript, agentReply, activeConversationId || undefined, data?.agent_response?.model);
 
-        if (data?.ignored) {
-          console.log('[VoiceV3] Turn ignored by AttentionEngine.');
+        if (data?.tts_audio_b64) {
+          await this.playAudioBase64(data.tts_audio_b64, callbacks, activeConversationId);
+        } else {
           this.isProcessing = false;
           if (this.isVoiceModeActive) {
             setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 200);
           }
-          return;
-        }
-
-        const transcript = data?.transcription?.text || '';
-        const agentResponseObj = data?.agent_response || {};
-        const agentReply = agentResponseObj.message || '';
-        const usedConvId = agentResponseObj.conversation_id || activeConversationId;
-        const usedModel = agentResponseObj.model || 'jarvis-voice';
-        const audioB64 = data?.tts_audio_b64 || '';
-        const stopTTSRequested = data?.agent_response?.stop_tts || false;
-
-        this.turnTimings.agentDone = Date.now();
-
-        if (stopTTSRequested) {
-          console.log('[INTERRUPT] current_goal_cancelled stop_tts=true');
-          this.stopSpeech();
-        }
-
-        if (transcript) {
-          console.log(`[VoiceV3] STT Transcript: "${transcript}"`);
-          if (callbacks.onTranscript) callbacks.onTranscript(transcript);
-        }
-
-        if (agentReply) {
-          console.log('[TTS DEBUG] response_text_received=true');
-          if (callbacks.onAgentResponse) {
-            callbacks.onAgentResponse(transcript, agentReply, usedConvId, usedModel);
-          }
-        }
-
-        if (audioB64 && (this.isVoiceModeActive || this.isProcessing) && !stopTTSRequested) {
-          this.turnTimings.ttsStart = Date.now();
-          console.log(`[TTS DEBUG] audio_bytes=${audioB64.length}`);
-          await this.playAudioBase64(audioB64, callbacks, usedConvId);
-        } else {
-          this.isProcessing = false;
-          if (this.isVoiceModeActive) {
-            setTimeout(() => this.startTurnListening(callbacks, usedConvId), 200);
-          }
-        }
-      } else {
-        console.warn('[TTS DEBUG] Transcribe endpoint HTTP error:', response.status);
-        this.isProcessing = false;
-        callbacks.onStateChange('error');
-        if (callbacks.onError) callbacks.onError(`HTTP ${response.status} error from transcription server.`);
-        if (this.isVoiceModeActive) {
-          setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1000);
         }
       }
-    } catch (err: any) {
-      console.error('[TTS DEBUG] Turn processing error:', err);
+    } catch (err) {
       this.isProcessing = false;
       callbacks.onStateChange('error');
-      if (callbacks.onError) callbacks.onError(err.message || 'Error processing audio turn.');
-      if (this.isVoiceModeActive) {
-        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 1000);
-      }
     }
   }
 

@@ -403,32 +403,57 @@ class LocalWhisperSTTProvider:
         logger.info(f"[AUDIO] pid={pid} output_samples={len(pcm)} rms={rms:.4f} peak={peak:.4f} speech_present=true")
 
         t_infer_start = time.time()
-        logger.info(f"[LOCAL STT] pid={pid} inference_started=true")
+
+        initial_prompt = (
+            "JARVIS Notepad Chrome Google Chrome YouTube Spotify WhatsApp Settings "
+            "VS Code Visual Studio Code File Explorer Task Manager Calculator PowerPoint Word Excel "
+            "open close launch start stop type search play pause resume"
+        )
+        vad_params = dict(min_silence_duration_ms=500, speech_pad_ms=400)
+
+        logger.info(
+            f"[STT CONFIG] pid={pid} model='{self.model_name}' device='{self.device}' "
+            f"language='en' beam_size=5 vad_filter=True condition_on_previous_text=False "
+            f"initial_prompt='{initial_prompt[:60]}...'"
+        )
 
         try:
-            segments, info = self.whisper_model.transcribe(
+            segments_gen, info = self.whisper_model.transcribe(
                 pcm,
                 beam_size=5,
                 language="en",
                 vad_filter=True,
+                vad_parameters=vad_params,
+                condition_on_previous_text=False,
+                initial_prompt=initial_prompt,
             )
+            segments = list(segments_gen)
             segment_texts = [seg.text.strip() for seg in segments if seg.text.strip()]
-            full_text = " ".join(segment_texts).strip()
+            raw_text = " ".join(segment_texts).strip()
+
+            lang_prob = getattr(info, "language_probability", 1.0)
+            logger.info(
+                f"[STT RESULT] raw_text='{raw_text}' language='{getattr(info, 'language', 'en')}' "
+                f"language_probability={lang_prob:.2f} segments={len(segment_texts)}"
+            )
+
+            # Apply conservative command normalization (e.g. "open not bad" -> "Open Notepad.")
+            from app.voice.normalization import normalize_voice_command
+            normalized_text, norm_rule = normalize_voice_command(raw_text)
 
             inference_ms = (time.time() - t_infer_start) * 1000.0
             t_post = time.time()
 
-            full_text = full_text.strip()
             postprocess_ms = (time.time() - t_post) * 1000.0
             total_ms = (time.time() - t_start) * 1000.0
 
             logger.info(f"[LOCAL STT] pid={pid} inference_completed=true decode_ms={decode_ms:.1f}ms inference_ms={inference_ms:.1f}ms postprocess_ms={postprocess_ms:.1f}ms total_ms={total_ms:.1f}ms")
-            logger.info(f"[LOCAL STT] pid={pid} segments={len(segment_texts)} text='{full_text}'")
+            logger.info(f"[LOCAL STT] pid={pid} segments={len(segment_texts)} raw_text='{raw_text}' final_text='{normalized_text}' norm_rule='{norm_rule or 'none'}'")
 
             return LocalVoiceTranscription(
-                text=full_text,
-                language=info.language if hasattr(info, "language") else "en",
-                confidence=0.98 if full_text else 0.0,
+                text=normalized_text,
+                language=getattr(info, "language", "en"),
+                confidence=0.98 if normalized_text else 0.0,
                 duration_ms=duration_ms,
                 decode_ms=decode_ms,
                 inference_ms=inference_ms,

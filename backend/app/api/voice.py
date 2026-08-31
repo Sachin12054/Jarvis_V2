@@ -217,3 +217,90 @@ async def generate_speech_endpoint(request: Request, payload: SpeakRequest):
 
     media_type = "audio/wav" if getattr(settings, "TTS_PROVIDER", "kokoro").lower() == "kokoro" else "audio/mpeg"
     return Response(content=audio_bytes, media_type=media_type)
+
+
+@router.post("/stream")
+async def stream_voice_turn(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    transcript_text: Optional[str] = Form(None),
+    conversation_id: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Real-time Voice turn streaming endpoint: Transcribes 100% LOCALLY, processes through JARVIS streaming brain,
+    and yields incremental text deltas and phrase-chunked Kokoro TTS audio chunks via Server-Sent Events (SSE).
+    """
+    import base64
+    import json
+    from fastapi.responses import StreamingResponse
+    from app.cognition.command_router import CommandRouter
+
+    stt_provider = get_stt_provider(request)
+    tts_service = get_tts_service(request)
+    t_start = time.time()
+    pid = os.getpid()
+
+    if transcript_text and transcript_text.strip():
+        transcription = LocalVoiceTranscription(
+            text=transcript_text.strip(),
+            provider="client_fallback",
+            confidence=0.99,
+        )
+    elif file:
+        audio_bytes = await file.read()
+        transcription = await stt_provider.transcribe(
+            audio_bytes=audio_bytes,
+            filename=file.filename or "speech.webm",
+            content_type=file.content_type or "audio/webm",
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Either audio file or transcript_text must be provided.")
+
+    async def sse_event_generator():
+        yield f"data: {json.dumps({'type': 'transcript', 'text': transcription.text, 'stt_ms': transcription.total_ms})}\n\n"
+
+        if not transcription.text:
+            yield f"data: {json.dumps({'type': 'done', 'total_ms': (time.time() - t_start) * 1000.0})}\n\n"
+            return
+
+        routed = await CommandRouter.route(transcription.text, channel="voice")
+        if routed.is_routed:
+            reply = routed.response_message or "Done."
+            logger.info(f"[VOICE STREAM FAST PATH] type='{routed.command_type}' reply='{reply}'")
+            yield f"data: {json.dumps({'type': 'text_delta', 'text': reply})}\n\n"
+
+            if tts_service.is_configured():
+                audio_bytes = await tts_service.generate_speech(reply)
+                if audio_bytes:
+                    b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    yield f"data: {json.dumps({'type': 'audio_chunk', 'text': reply, 'audio_b64': b64, 'format': 'wav'})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done', 'total_ms': (time.time() - t_start) * 1000.0})}\n\n"
+            return
+
+        chat_service = ChatService()
+
+        async def raw_text_stream():
+            async for data in chat_service.handle_chat_request_stream(
+                db=db,
+                user_message=transcription.text,
+                conversation_id=conversation_id,
+                channel="voice",
+            ):
+                chunk = data.get("chunk", "")
+                if chunk:
+                    yield chunk
+
+        from app.voice.tts_streamer import stream_chat_and_tts
+        async for event in stream_chat_and_tts(raw_text_stream(), tts_service=tts_service):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        sse_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

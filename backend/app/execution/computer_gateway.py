@@ -103,14 +103,14 @@ class ComputerUseGateway:
                 requested_action=f"launch_app:{app_name}",
                 executed=True,
                 verified=True,
-                evidence=res.get("data", {}),
+                evidence=res.get("data") or {},
             )
         logger.error(f"[COMPUTER ERROR] CUA launch_app error for '{app_name}': {res.get('error')}")
         return ActionResult(
             requested_action=f"launch_app:{app_name}",
             executed=False,
             verified=False,
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -121,7 +121,7 @@ class ComputerUseGateway:
             requested_action="get_window_state",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -132,7 +132,7 @@ class ComputerUseGateway:
             requested_action=f"bring_to_front:{window_id}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -143,7 +143,7 @@ class ComputerUseGateway:
             requested_action=f"type_text:{text[:20]}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -154,7 +154,7 @@ class ComputerUseGateway:
             requested_action=f"click:({x},{y})",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -165,7 +165,7 @@ class ComputerUseGateway:
             requested_action=f"double_click:({x},{y})",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -176,7 +176,7 @@ class ComputerUseGateway:
             requested_action=f"right_click:({x},{y})",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -187,7 +187,7 @@ class ComputerUseGateway:
             requested_action=f"press_key:{key}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -198,7 +198,7 @@ class ComputerUseGateway:
             requested_action=f"hotkey:{'+'.join(keys)}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -209,7 +209,7 @@ class ComputerUseGateway:
             requested_action=f"set_value:{element_id}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 
@@ -220,7 +220,7 @@ class ComputerUseGateway:
             requested_action=f"verify_state:{condition}",
             executed=res.get("success", False),
             verified=res.get("success", False),
-            evidence=res.get("data", {}),
+            evidence=res.get("data") or {},
             error=res.get("error"),
         )
 

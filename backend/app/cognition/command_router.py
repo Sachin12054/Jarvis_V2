@@ -19,7 +19,8 @@ class CommandRouter:
 
     @classmethod
     async def route(cls, user_message: str, channel: str = "chat") -> RoutedCommand:
-        clean = user_message.strip().lower()
+        clean = re.sub(r'[^\w\s]', ' ', user_message.strip().lower()).strip()
+        clean = re.sub(r'\s+', ' ', clean)
         gateway = ComputerUseGateway.get_instance()
 
         # Priority 0: Emergency Interruption / Stop
@@ -54,7 +55,7 @@ class CommandRouter:
             )
 
         # Priority 1: Direct Physical Application Launch & Focus Commands
-        if re.search(r'\b(?:open|launch|start|bring\s+up|get)\s+(?:my\s+)?chrome\b', clean):
+        if re.search(r'\b(?:open|launch|start|bring\s+up|get)\s+(?:my\s+)?(?:google\s+)?chrome\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_chrome' clean='{clean}'")
             res = await gateway.focus_window("Chrome")
             reply = "Chrome is open." if res.verified else "Couldn't open Chrome."
@@ -66,7 +67,7 @@ class CommandRouter:
                 response_message=reply,
             )
 
-        if re.search(r'\b(?:open|launch|start|switch\s+to)\s+(?:vs\s*code|code)\b', clean):
+        if re.search(r'\b(?:open|launch|start|switch\s+to)\s+(?:vs\s*code|visual\s+studio\s+code|code)\b', clean):
             logger.info(f"[ROUTER] Priority 1 matched: command_type='open_vscode' clean='{clean}'")
             res = await gateway.focus_window("VS Code")
             reply = "VS Code is open." if res.verified else "Couldn't open VS Code."
