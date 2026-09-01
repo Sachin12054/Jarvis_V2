@@ -41,3 +41,24 @@ class ResponseType(str, Enum):
     ACTION = "action"
     CLARIFICATION = "clarification"
     ERROR = "error"
+
+
+class TaskState(str, Enum):
+    PENDING = "PENDING"
+    PLANNING = "PLANNING"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    WAITING = "WAITING"
+    VERIFYING = "VERIFYING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class TaskStepState(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    CANCELLED = "CANCELLED"

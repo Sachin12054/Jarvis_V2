@@ -14,6 +14,7 @@ from app.core.contracts import (
 from app.core.execution import DirectActionExecutor
 from app.core.knowledge import KnowledgeHandler, LLMProviderPort
 from app.core.tools import ToolHandler, ToolPort
+from app.core.brain import TaskPlanner, CapabilityResolver, CapabilityHandler, TaskExecutionCoordinator
 from app.core.orchestrator import JarvisCoreOrchestrator
 
 
@@ -72,14 +73,22 @@ async def test_tool_call_connected_flow():
 
 
 @pytest.mark.asyncio
-async def test_complex_task_remains_unconnected():
-    mock_executor = MagicMock(spec=DirectActionExecutor)
-    orchestrator = JarvisCoreOrchestrator(executor=mock_executor)
+async def test_complex_task_connected_flow():
+    planner = TaskPlanner()
+    resolver = CapabilityResolver()
+    handler = MagicMock(spec=CapabilityHandler)
+    exec_res = ExecutionResult(action_type="refactor", status=ExecutionStatus.VERIFIED, success=True)
+    ver_res = VerificationResult(verified=True, status="SUCCESS")
+    handler.execute = AsyncMock(return_value=(exec_res, ver_res))
+    resolver.register("refactor database schema", handler)
+
+    coordinator = TaskExecutionCoordinator(planner=planner, resolver=resolver)
+    orchestrator = JarvisCoreOrchestrator(task_coordinator=coordinator, planner=planner)
     req = JarvisRequest(conversation_id="conv-c", raw_input="Refactor database schema")
     resp = await orchestrator.process_request(req)
 
-    mock_executor.execute.assert_not_called()
-    assert "COMPLEX_TASK is not yet connected" in resp.message
+    assert resp.response_type == ResponseType.ACTION
+    assert resp.message == "Task completed successfully."
 
 
 @pytest.mark.asyncio
