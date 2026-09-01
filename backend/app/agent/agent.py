@@ -39,7 +39,9 @@ from app.verification.action_verifier import ActionVerifier
 
 
 class JARVISAgent:
-    """JARVIS Master Autonomous Computer-Use Agent Runtime with CommandRouter, ComputerUseGateway, CognitiveCore, WorldState, and ActionVerifier."""
+    """DEPRECATED COMPONENT: JARVISAgent is preserved for backward-compatibility test suites.
+    The canonical runtime entry point is JarvisCoreOrchestrator in backend/app/core/orchestrator.py.
+    """
 
     def __init__(
         self,

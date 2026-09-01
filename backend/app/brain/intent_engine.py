@@ -6,7 +6,9 @@ from app.core.logging import logger
 
 
 class IntentEngine:
-    """Unified Intent Engine with Real Screen Perception, Desktop Controls, and Live Monitoring."""
+    """DEPRECATED COMPONENT: IntentEngine is preserved for backward-compatibility test suites.
+    Canonical runtime intent parsing is performed by UnderstandingPipeline in backend/app/core/understanding/.
+    """
 
     @classmethod
     def analyze(

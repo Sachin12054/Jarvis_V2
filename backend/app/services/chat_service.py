@@ -13,11 +13,15 @@ from app.core.config import settings
 from app.memory.profile import UserProfileService
 from app.memory.service import MemoryService
 from app.tools.router import ToolIntentRouter
+from app.core.contracts import JarvisRequest, JarvisResponse, InputChannel
+from app.core.adapters import RequestAdapter, ResponseAdapter
+from app.core.orchestrator import JarvisCoreOrchestrator
+from app.schemas.chat import ChatRequest, ChatResponse
 from app.core.logging import logger
 
 
 class ChatService:
-    """Application Service Layer bridging API controllers, tool execution, memory intelligence, and brain orchestration."""
+    """Application Service Layer bridging API controllers to canonical JarvisCoreOrchestrator."""
 
     def __init__(
         self,
@@ -28,6 +32,7 @@ class ChatService:
         tool_router: Optional[ToolIntentRouter] = None,
         grounded_generator: Optional[GroundedResponseGenerator] = None,
         agent: Optional[JARVISAgent] = None,
+        core_orchestrator: Optional[JarvisCoreOrchestrator] = None,
     ):
         self.conversation_manager = conversation_manager or ConversationManager()
         self.orchestrator = orchestrator or JARVISOrchestrator()
@@ -36,6 +41,7 @@ class ChatService:
         self.tool_router = tool_router or ToolIntentRouter()
         self.grounded_generator = grounded_generator or GroundedResponseGenerator(user_profile_service=self.user_profile_service)
         self.agent = agent or JARVISAgent(grounded_generator=self.grounded_generator)
+        self.core_orchestrator = core_orchestrator or JarvisCoreOrchestrator()
 
     @staticmethod
     def get_casual_companion_response(user_message: str) -> Optional[str]:
@@ -58,52 +64,41 @@ class ChatService:
         conversation_id: Optional[str] = None,
         channel: str = "chat",
     ) -> Dict[str, Any]:
-        """Handles chat request business logic via JARVIS V5 Master Personal AI Agent runtime."""
+        """Handles chat request business logic via canonical JarvisCoreOrchestrator V2 runtime pipeline."""
         conversation = await self.conversation_manager.get_or_create_conversation(db, conversation_id)
 
-        # 1. Fetch Recent History for Contextual Resolution
-        raw_history = await self.conversation_manager.get_recent_history(db, conversation.id)
-        formatted_history = HistoryFormatter.to_llm_messages(raw_history)
-
-        if channel == "voice":
-            logger.info(f"[VOICE] history_loaded count={len(formatted_history)}")
-
-        # 2. Casual Companion Greeting Fast-Path
+        # 1. Casual Companion Greeting Fast-Path
         casual_reply = self.get_casual_companion_response(user_message)
         if casual_reply:
             await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="user", content=user_message)
             await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="assistant", content=casual_reply, extra_metadata={"model": "jarvis-companion", "channel": channel})
             return {"conversation_id": conversation.id, "message": casual_reply, "model": "jarvis-companion"}
 
-        # 3. Log incoming browser coordinates if present
-        coord_match = re.search(r'latitude:\s*([\-0-9\.]+),\s*longitude:\s*([\-0-9\.]+)', user_message, re.IGNORECASE)
-        if coord_match:
-            lat = coord_match.group(1)
-            lng = coord_match.group(2)
-            acc_match = re.search(r'accuracy:\s*([0-9\.]+)', user_message, re.IGNORECASE)
-            acc = acc_match.group(1) if acc_match else "0"
-            logger.info(f"[LOCATION DEBUG] Received browser coordinates lat={lat} lng={lng} accuracy={acc}")
-            logger.info("[LOCATION DEBUG] Routing to get_current_location")
+        # 2. Convert incoming request to canonical JarvisRequest using RequestAdapter
+        chat_req = ChatRequest(message=user_message, conversation_id=conversation.id)
+        input_channel = InputChannel.VOICE if channel == "voice" else InputChannel.TEXT
+        jarvis_req = RequestAdapter.from_chat_request(chat_req, channel=input_channel)
 
-        # 4. Invoke JARVIS V5 Master Personal AI Agent Turn
-        agent_result = await self.agent.process_turn(
-            db=db,
-            user_message=user_message,
-            conversation_id=conversation.id,
-            channel=channel,
-            conversation_history=formatted_history,
-        )
+        # 3. Process request through canonical JarvisCoreOrchestrator (Single Brain Entry Point)
+        jarvis_resp = await self.core_orchestrator.process_request(jarvis_req)
 
-        reply_text = agent_result["message"]
-        used_model = agent_result.get("model", "gemma-3-4b:latest")
+        # 4. Convert canonical JarvisResponse to API ChatResponse using ResponseAdapter
+        chat_resp = ResponseAdapter.to_chat_response(jarvis_resp)
 
+        # 5. Persist turn in database
         await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="user", content=user_message)
-        await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="assistant", content=reply_text, extra_metadata={"model": used_model, "channel": channel})
+        await self.conversation_manager.add_message(
+            db=db,
+            conversation_id=conversation.id,
+            role="assistant",
+            content=chat_resp.message,
+            extra_metadata={"model": chat_resp.model, "channel": channel, "response_type": jarvis_resp.response_type.value},
+        )
 
         return {
             "conversation_id": conversation.id,
-            "message": reply_text,
-            "model": used_model,
+            "message": chat_resp.message,
+            "model": chat_resp.model,
         }
 
     async def handle_chat_request_stream(
@@ -114,17 +109,10 @@ class ChatService:
         channel: str = "chat",
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Handles chat request streaming real-time tokens."""
+        """Handles chat request streaming real-time tokens via canonical JarvisCoreOrchestrator V2 runtime pipeline."""
         conversation = await self.conversation_manager.get_or_create_conversation(db, conversation_id)
 
-        # 1. Fetch Recent History for Contextual Resolution
-        raw_history = await self.conversation_manager.get_recent_history(db, conversation.id)
-        formatted_history = HistoryFormatter.to_llm_messages(raw_history)
-
-        if channel == "voice":
-            logger.info(f"[VOICE] history_loaded count={len(formatted_history)}")
-
-        # 2. Casual Companion Greeting Fast-Path
+        # 1. Casual Companion Greeting Fast-Path
         casual_reply = self.get_casual_companion_response(user_message)
         if casual_reply:
             await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="user", content=user_message)
@@ -132,33 +120,29 @@ class ChatService:
             yield {"conversation_id": conversation.id, "chunk": casual_reply, "model": "jarvis-companion"}
             return
 
-        # 3. Log incoming browser coordinates if present
-        coord_match = re.search(r'latitude:\s*([\-0-9\.]+),\s*longitude:\s*([\-0-9\.]+)', user_message, re.IGNORECASE)
-        if coord_match:
-            lat = coord_match.group(1)
-            lng = coord_match.group(2)
-            acc_match = re.search(r'accuracy:\s*([0-9\.]+)', user_message, re.IGNORECASE)
-            acc = acc_match.group(1) if acc_match else "0"
-            logger.info(f"[LOCATION DEBUG] Received browser coordinates lat={lat} lng={lng} accuracy={acc}")
-            logger.info("[LOCATION DEBUG] Routing to get_current_location")
+        # 2. Convert incoming request to canonical JarvisRequest using RequestAdapter
+        chat_req = ChatRequest(message=user_message, conversation_id=conversation.id)
+        input_channel = InputChannel.VOICE if channel == "voice" else InputChannel.TEXT
+        jarvis_req = RequestAdapter.from_chat_request(chat_req, channel=input_channel)
 
-        # 4. Invoke Agent Turn
-        agent_result = await self.agent.process_turn(
-            db=db,
-            user_message=user_message,
-            conversation_id=conversation.id,
-            channel=channel,
-            conversation_history=formatted_history,
-        )
+        # 3. Process request through canonical JarvisCoreOrchestrator
+        jarvis_resp = await self.core_orchestrator.process_request(jarvis_req, cancel_event=cancel_event)
 
-        reply_text = agent_result["message"]
-        used_model = agent_result.get("model", "gemma-3-4b:latest")
+        # 4. Convert canonical JarvisResponse to API ChatResponse using ResponseAdapter
+        chat_resp = ResponseAdapter.to_chat_response(jarvis_resp)
 
+        # 5. Persist turn in database
         await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="user", content=user_message)
-        await self.conversation_manager.add_message(db=db, conversation_id=conversation.id, role="assistant", content=reply_text, extra_metadata={"model": used_model, "channel": channel})
+        await self.conversation_manager.add_message(
+            db=db,
+            conversation_id=conversation.id,
+            role="assistant",
+            content=chat_resp.message,
+            extra_metadata={"model": chat_resp.model, "channel": channel, "response_type": jarvis_resp.response_type.value},
+        )
 
         yield {
             "conversation_id": conversation.id,
-            "chunk": reply_text,
-            "model": used_model,
+            "chunk": chat_resp.message,
+            "model": chat_resp.model,
         }

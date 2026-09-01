@@ -9,10 +9,8 @@ from app.core.logging import logger
 
 
 class JARVISOrchestrator:
-    """Central Orchestrator runtime for JARVIS Brain.
-
-    Routes user messages, manages context preparation, triggers LLM reasoning,
-    and provides extension hooks for Tool Registry and Permission Manager.
+    """DEPRECATED COMPONENT: JARVISOrchestrator is preserved for backward-compatibility test suites.
+    The canonical runtime entry point is JarvisCoreOrchestrator in backend/app/core/orchestrator.py.
     """
 
     def __init__(
