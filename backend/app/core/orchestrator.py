@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional, Dict, Any
 from app.core.contracts import (
     JarvisRequest,
@@ -12,21 +13,34 @@ from app.core.contracts import (
 from app.core.understanding import UnderstandingPipeline
 from app.core.decision import DecisionGate
 from app.core.execution import DirectActionExecutor
+from app.core.knowledge import KnowledgeHandler
+from app.core.tools import ToolHandler
 
 
 class JarvisCoreOrchestrator:
     """Unified Core Orchestrator for JARVIS V2.
 
     Coordinates the canonical pipeline:
-    JarvisRequest to UnderstandingPipeline to DecisionGate to DirectActionExecutor to JarvisResponse
+    JarvisRequest to UnderstandingPipeline to DecisionGate to Handlers to JarvisResponse
 
     Contains zero direct infrastructure dependencies (no Ollama, Whisper, Kokoro, FastAPI, CUA Driver).
     """
 
-    def __init__(self, executor: Optional[DirectActionExecutor] = None):
+    def __init__(
+        self,
+        executor: Optional[DirectActionExecutor] = None,
+        knowledge_handler: Optional[KnowledgeHandler] = None,
+        tool_handler: Optional[ToolHandler] = None,
+    ):
         self._executor = executor or DirectActionExecutor()
+        self._knowledge_handler = knowledge_handler or KnowledgeHandler()
+        self._tool_handler = tool_handler or ToolHandler()
 
-    async def process_request(self, request: JarvisRequest) -> JarvisResponse:
+    async def process_request(
+        self,
+        request: JarvisRequest,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> JarvisResponse:
         """Processes a canonical JarvisRequest through the core architecture pipeline."""
 
         # 1. Understanding Pipeline
@@ -66,7 +80,24 @@ class JarvisCoreOrchestrator:
                 error=exec_res.error_message if not exec_res.success else None,
             )
 
-        # 4. Handle CLARIFICATION Strategy
+        # 4. Handle KNOWLEDGE_QUERY Strategy (M1.7 Connection)
+        if decision.strategy == DecisionStrategy.KNOWLEDGE_QUERY:
+            return await self._knowledge_handler.handle_knowledge_query(
+                request=request,
+                understanding=understanding,
+                decision=decision,
+                cancel_event=cancel_event,
+            )
+
+        # 5. Handle TOOL_CALL Strategy (M1.7 Connection)
+        if decision.strategy == DecisionStrategy.TOOL_CALL:
+            return await self._tool_handler.handle_tool_call(
+                request=request,
+                understanding=understanding,
+                decision=decision,
+            )
+
+        # 6. Handle CLARIFICATION Strategy
         if decision.strategy == DecisionStrategy.CLARIFICATION:
             reason = decision.reason or understanding.clarification_reason or "Could you please clarify your request?"
             return JarvisResponse(
@@ -79,7 +110,7 @@ class JarvisCoreOrchestrator:
                 metadata={"strategy": decision.strategy.value, "decision_id": decision.decision_id},
             )
 
-        # 5. Handle CANCEL Strategy
+        # 7. Handle CANCEL Strategy
         if decision.strategy == DecisionStrategy.CANCEL:
             return JarvisResponse(
                 request_id=request.request_id,
@@ -91,7 +122,7 @@ class JarvisCoreOrchestrator:
                 metadata={"strategy": decision.strategy.value, "decision_id": decision.decision_id},
             )
 
-        # 6. Handle Non-Connected Strategies (KNOWLEDGE_QUERY, TOOL_CALL, COMPLEX_TASK, NO_OP)
+        # 8. Handle Explicitly Unimplemented Strategies (COMPLEX_TASK, NO_OP)
         strategy_name = decision.strategy.value
         return JarvisResponse(
             request_id=request.request_id,

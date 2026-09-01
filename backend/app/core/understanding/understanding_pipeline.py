@@ -31,6 +31,15 @@ class UnderstandingPipeline:
 
     APP_OPEN_KEYWORDS = ("open", "launch", "start", "bring up", "switch to")
     APP_CLOSE_KEYWORDS = ("close", "quit", "exit")
+    COMPLEX_KEYWORDS = ("complex task", "multi step", "refactor database schema")
+
+    TOOL_KEYWORDS = {
+        "search for pdf files": ("FILESYSTEM_SEARCH", "file_search"),
+        "search for text files": ("FILESYSTEM_SEARCH", "file_search"),
+        "search for files": ("FILESYSTEM_SEARCH", "file_search"),
+        "list directory": ("FILESYSTEM_READ", "list_directory"),
+        "get location": ("LOCATION", "get_current_location"),
+    }
 
     @classmethod
     def process(cls, request: JarvisRequest) -> UnderstandingResult:
@@ -49,7 +58,7 @@ class UnderstandingPipeline:
                 clarification_reason="Empty input text",
             )
 
-        # Step 1: Voice Normalization (Wake-word stripping and alias mapping)
+        # Step 1: Voice Normalization
         norm_text, norm_rule = normalize_voice_command(normalized_text or raw_text)
         text_to_parse = norm_text if norm_text else raw_text
         clean_lower = "".join(ch for ch in text_to_parse.lower() if ch.isalnum() or ch.isspace()).strip()
@@ -85,8 +94,29 @@ class UnderstandingPipeline:
                     clarification_reason="Target entity is ambiguous" if is_ambiguous else None,
                 )
 
-        # Step 4: Priority 2 - Math or General Knowledge Query
-        if re.search(r"\d+\s*[\+\-\*\/]\s*\d+", clean_lower) or any(clean_lower.startswith(q) for q in ["what is", "who is", "explain", "tell me about"]):
+        # Step 4: Tool Keywords Recognition
+        if clean_lower in cls.TOOL_KEYWORDS:
+            intent_name, tool_name = cls.TOOL_KEYWORDS[clean_lower]
+            return UnderstandingResult(
+                intent=intent_name,
+                entities={"tool_name": tool_name, "query": text_to_parse},
+                target_device=request.target_device,
+                confidence=request.confidence,
+                ambiguity=False,
+            )
+
+        # Step 5: Complex Task Recognition
+        if any(kw in clean_lower for kw in cls.COMPLEX_KEYWORDS):
+            return UnderstandingResult(
+                intent="COMPLEX_TASK",
+                entities={"query": text_to_parse},
+                target_device=request.target_device,
+                confidence=request.confidence,
+                ambiguity=False,
+            )
+
+        # Step 6: Priority 2 - Math or General Knowledge Query
+        if any(clean_lower.startswith(q) for q in ["what is", "who is", "explain", "tell me about"]):
             return UnderstandingResult(
                 intent="KNOWLEDGE_QUERY",
                 entities={"query": text_to_parse},
@@ -95,7 +125,7 @@ class UnderstandingPipeline:
                 ambiguity=False,
             )
 
-        # Step 5: Priority 3 - Structured Intent Recognition (IntentEngine)
+        # Step 7: Priority 3 - Structured Intent Recognition (IntentEngine)
         try:
             intent_plan: IntentPlan = IntentEngine.analyze(text_to_parse, channel=request.input_channel.value)
             if intent_plan and intent_plan.intents:
