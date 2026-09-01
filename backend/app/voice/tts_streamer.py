@@ -51,14 +51,36 @@ class ThinkingStreamFilter:
         return ""
 
 
+def clean_tts_text(text: str) -> str:
+    """Cleans raw text for natural speech synthesis: removes markdown code blocks, links, formatting, and internal JSON."""
+    if not text:
+        return ""
+    # Strip markdown code blocks ```...```
+    cleaned = re.sub(r'```[\s\S]*?```', '', text)
+    # Strip inline code `...`
+    cleaned = re.sub(r'`[^`]+`', '', cleaned)
+    # Strip markdown links [label](url) -> label
+    cleaned = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', cleaned)
+    # Strip formatting symbols (*, _, #)
+    cleaned = re.sub(r'[*_#~]', '', cleaned)
+    # Normalize spaces before punctuation
+    cleaned = re.sub(r'\s+([,.!?])', r'\1', cleaned)
+    # Strip json blocks {...} if standalone
+    if cleaned.strip().startswith('{') and cleaned.strip().endswith('}'):
+        cleaned = ""
+    return cleaned.strip()
+
+
 async def stream_chat_and_tts(
     text_stream: AsyncGenerator[str, None],
     tts_service: Optional[LocalKokoroTTSService] = None,
     min_chunk_length: int = 15,
     cancel_event: Optional[asyncio.Event] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """Consumes an LLM text delta stream, filters out internal thinking, accumulates phrases,
-    synthesizes TTS chunks using Kokoro, and yields SSE event payloads.
+    """Consumes an LLM text delta stream, filters out internal thinking & markdown, accumulates phrases,
+    synthesizes TTS chunks using Kokoro in strict sequence, and yields SSE event payloads.
     """
     filter_engine = ThinkingStreamFilter()
     accumulator = ""
@@ -66,6 +88,7 @@ async def stream_chat_and_tts(
     t_start = time.time()
     first_token_sent = False
     first_audio_sent = False
+    sequence = 0
 
     async for chunk in text_stream:
         if cancel_event and cancel_event.is_set():
@@ -88,13 +111,19 @@ async def stream_chat_and_tts(
         match = SENTENCE_SPLIT_PATTERN.search(accumulator)
         if match and len(accumulator) >= min_chunk_length:
             boundary_idx = match.end()
-            phrase = accumulator[:boundary_idx].strip()
+            raw_phrase = accumulator[:boundary_idx]
             accumulator = accumulator[boundary_idx:]
 
+            phrase = clean_tts_text(raw_phrase)
             if phrase and tts.is_configured() and not (cancel_event and cancel_event.is_set()):
                 t_tts0 = time.time()
-                audio_bytes = await tts.generate_speech(phrase)
-                if audio_bytes and not (cancel_event and cancel_event.is_set()):
+                try:
+                    audio_bytes = await tts.generate_speech(phrase)
+                except Exception as tts_err:
+                    logger.warning(f"[STREAMING TTS ERROR] Speech generation failed for phrase '{phrase}': {tts_err}")
+                    audio_bytes = None
+
+                if audio_bytes and len(audio_bytes) > 0 and not (cancel_event and cancel_event.is_set()):
                     b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
                     if not first_audio_sent:
                         first_audio_ms = (time.time() - t_start) * 1000.0
@@ -103,29 +132,42 @@ async def stream_chat_and_tts(
 
                     yield {
                         "type": "audio_chunk",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "sequence": sequence,
                         "text": phrase,
                         "audio_b64": b64_audio,
                         "format": "wav",
                         "latency_ms": (time.time() - t_tts0) * 1000.0,
                     }
+                    sequence += 1
 
     if cancel_event and cancel_event.is_set():
         return
 
     # Flush remaining buffer
     remaining_text = filter_engine.flush() + accumulator
-    if remaining_text.strip() and tts.is_configured() and not (cancel_event and cancel_event.is_set()):
-        phrase = remaining_text.strip()
+    phrase = clean_tts_text(remaining_text)
+    if phrase and tts.is_configured() and not (cancel_event and cancel_event.is_set()):
         t_tts0 = time.time()
-        audio_bytes = await tts.generate_speech(phrase)
-        if audio_bytes and not (cancel_event and cancel_event.is_set()):
+        try:
+            audio_bytes = await tts.generate_speech(phrase)
+        except Exception as tts_err:
+            logger.warning(f"[STREAMING TTS ERROR] Final phrase speech generation failed: {tts_err}")
+            audio_bytes = None
+
+        if audio_bytes and len(audio_bytes) > 0 and not (cancel_event and cancel_event.is_set()):
             b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
             yield {
                 "type": "audio_chunk",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "sequence": sequence,
                 "text": phrase,
                 "audio_b64": b64_audio,
                 "format": "wav",
                 "latency_ms": (time.time() - t_tts0) * 1000.0,
             }
+            sequence += 1
 
     yield {"type": "done", "total_ms": (time.time() - t_start) * 1000.0}

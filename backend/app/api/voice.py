@@ -12,8 +12,11 @@ from app.services.chat_service import ChatService
 from app.services.elevenlabs_service import ElevenLabsVoiceService
 from app.voice.stt_provider import LocalWhisperSTTProvider, LocalVoiceTranscription
 from app.voice.kokoro_tts import LocalKokoroTTSService
+from app.voice.session import VoiceSessionManager
+from app.voice.contracts import VoiceState, VoiceEvent, VoiceEventType
 
 router = APIRouter(prefix="/api/v1/voice", tags=["Voice Interface"])
+global_voice_session_manager = VoiceSessionManager()
 
 
 class SpeakRequest(BaseModel):
@@ -236,8 +239,11 @@ async def cancel_voice_turn(payload: CancelVoiceTurnRequest):
     if turn_id in ACTIVE_TURNS:
         context = ACTIVE_TURNS[turn_id]
         cancel_event: asyncio.Event = context.get("cancel_event")
+        session_id: Optional[str] = context.get("session_id")
         if cancel_event:
             cancel_event.set()
+        if session_id:
+            await global_voice_session_manager.request_interruption(session_id, turn_id=turn_id)
         logger.info(f"[VOICE CANCEL ENDPOINT] pid={pid} turn_id='{turn_id}' cancel_event_signaled=true")
         return {"success": True, "message": "Voice turn cancelled.", "turn_id": turn_id}
 
@@ -388,7 +394,7 @@ async def stream_voice_turn(
                             yield chunk
 
                 from app.voice.tts_streamer import stream_chat_and_tts
-                async for event in stream_chat_and_tts(raw_text_stream(), tts_service=tts_service, cancel_event=cancel_event):
+                async for event in stream_chat_and_tts(raw_text_stream(), tts_service=tts_service, cancel_event=cancel_event, turn_id=active_turn_id):
                     if cancel_event.is_set():
                         yield f"data: {json.dumps({'type': 'interrupted', 'turn_id': active_turn_id, 'total_ms': (time.time() - t_start) * 1000.0})}\n\n"
                         return
