@@ -27,9 +27,15 @@ export class VoiceRecognitionService {
   private vadInterval: number | null = null;
   private isAudioUnlocked = false;
 
-  // Pre-roll Ring Buffer (stores last ~350ms PCM frames to preserve initial consonants)
+  // Pre-roll Ring Buffer
   private preRollBuffer: Float32Array[] = [];
   private static readonly PRE_ROLL_MAX_FRAMES = 22; // ~350ms at 60fps analysis
+
+  // VAD & Turn Finalization Constants
+  private static readonly SILENCE_HANGOVER_MS = 1200; // 1.2s continuous silence completes turn
+  private static readonly MIN_SPEECH_DURATION_MS = 500; // 0.5s minimum speech before turn completion
+  private static readonly SAFETY_MAX_UTTERANCE_MS = 30000; // 30s maximum utterance duration limit
+  private static readonly BARGE_IN_GUARD_MS = 600; // 600ms post-finalization guard window
 
   // State Management & Turn Tracking
   private isVoiceModeActive = false;
@@ -42,7 +48,7 @@ export class VoiceRecognitionService {
   private audioQueue: AudioQueueItem[] = [];
   private isPlayingQueue = false;
 
-  // Adaptive VAD Calibration Parameters
+  // Adaptive VAD Calibration Parameters & Debouncing
   private noiseFloor = 8.0; // Out of 255
   private speechThreshold = 18.0;
   private silenceThreshold = 10.0;
@@ -50,6 +56,8 @@ export class VoiceRecognitionService {
   private speechStartTimestamp: number | null = null;
   private hasSpokenInCurrentTurn = false;
   private turnStartTimestamp = 0;
+  private lastTurnFinalizedTimestamp = 0;
+  private consecutiveSpeechFrames = 0;
 
   isSupported(): boolean {
     return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -66,7 +74,6 @@ export class VoiceRecognitionService {
   private setVoiceState(state: VoiceState, callbacks?: VoiceCallbacks): void {
     this.currentState = state;
     if (callbacks?.onStateChange) {
-      // Map VoiceState to JarvisState
       let jarvisState: JarvisState = 'idle';
       if (state === 'listening' || state === 'interrupting') jarvisState = 'listening';
       else if (state === 'processing' || state === 'thinking') jarvisState = 'thinking';
@@ -132,7 +139,7 @@ export class VoiceRecognitionService {
     console.log('[VOICE STATE] Continuous Voice Mode deactivated.');
     this.isVoiceModeActive = false;
     this.stopSpeech();
-    this.cancelActiveTurn();
+    this.cancelActiveTurn('deactivate');
     this.stopVAD();
     this.stopMediaRecorder();
 
@@ -143,9 +150,6 @@ export class VoiceRecognitionService {
     this.setVoiceState('idle');
   }
 
-  /**
-   * Phase 6 & Phase 7 & Phase 8: Immediate Silence and Turn Cancellation (Barge-In)
-   */
   stopSpeech(): void {
     this.audioQueue = [];
     this.isPlayingQueue = false;
@@ -159,30 +163,27 @@ export class VoiceRecognitionService {
     }
   }
 
-  private cancelActiveTurn(): void {
+  private cancelActiveTurn(reason: string = 'user_action'): void {
     if (this.activeTurnId) {
       const turnToCancel = this.activeTurnId;
-      console.log(`[INTERRUPT] Signaling backend cancellation for turn_id='${turnToCancel}'...`);
+      console.log(`[VOICE CANCEL] reason='${reason}' turn_id='${turnToCancel}' aborting fetch and canceling turn...`);
 
-      // 1. Abort active HTTP fetch immediately
       if (this.activeAbortController) {
         this.activeAbortController.abort();
         this.activeAbortController = null;
       }
 
-      // 2. Fire-and-forget backend cancellation POST /api/v1/voice/cancel
       fetch('/api/v1/voice/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ turn_id: turnToCancel }),
-      }).catch((err) => console.warn('[INTERRUPT] Cancel POST warning:', err));
+      }).catch((err) => console.warn('[VOICE CANCEL] Cancel POST warning:', err));
     }
   }
 
   private async startTurnListening(callbacks: VoiceCallbacks, activeConversationId?: string | null): Promise<void> {
     if (!this.isVoiceModeActive) return;
 
-    // Create unique turn_id and capture_id for strict isolation
     this.activeTurnId = `turn_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
     this.activeCaptureId = `cap_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
@@ -193,18 +194,25 @@ export class VoiceRecognitionService {
     this.silenceStartTimestamp = null;
     this.speechStartTimestamp = null;
     this.turnStartTimestamp = Date.now();
+    this.consecutiveSpeechFrames = 0;
     this.preRollBuffer = [];
 
     try {
       if (!this.audioStream || !this.audioStream.active) {
-        this.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        this.audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 16000,
+          },
+        });
       }
 
       const dataChunks: Blob[] = [];
       const mimeType = this.getSupportedMimeType();
       const options = mimeType ? { mimeType } : undefined;
 
-      // Phase 2: Create ONE single-use MediaRecorder per capture session
       const recorder = new MediaRecorder(this.audioStream, options);
       this.mediaRecorder = recorder;
 
@@ -217,13 +225,13 @@ export class VoiceRecognitionService {
       recorder.onstart = () => {
         if (this.activeTurnId !== currentTurnId) return;
         this.setVoiceState('listening', callbacks);
-        console.log(`[VAD] capture_started=true capture_id='${currentCaptureId}' turn_id='${currentTurnId}' mime='${mimeType || 'default'}'`);
+        console.log(`[VOICE VAD] capture_started=true capture_id='${currentCaptureId}' turn_id='${currentTurnId}' mime='${mimeType || 'default'}'`);
         this.startVAD(callbacks, activeConversationId);
       };
 
       recorder.onstop = async () => {
         if (this.activeTurnId !== currentTurnId) {
-          console.log(`[VAD] Stale recorder.onstop ignored for turn_id='${currentTurnId}'`);
+          console.log(`[VOICE VAD] Stale recorder.onstop ignored for turn_id='${currentTurnId}'`);
           return;
         }
 
@@ -232,11 +240,10 @@ export class VoiceRecognitionService {
         const finalBlob = new Blob(dataChunks, { type: recordingMime });
         const speechDurationMs = Date.now() - (this.speechStartTimestamp || this.turnStartTimestamp);
 
-        console.log(`[VAD] capture_finished=true capture_id='${currentCaptureId}' blob_bytes=${finalBlob.size} speech_duration_ms=${speechDurationMs}`);
+        console.log(`[VOICE VAD] capture_finished=true capture_id='${currentCaptureId}' blob_bytes=${finalBlob.size} speech_duration_ms=${speechDurationMs}`);
 
-        // Phase 2: Validate Blob size and speech detection
         if (finalBlob.size < 300 || !this.hasSpokenInCurrentTurn) {
-          console.log('[VAD] Audio empty or near-zero energy. Restarting listener turn.');
+          console.log('[VOICE VAD] Audio empty or near-zero energy. Restarting listener turn.');
           if (this.isVoiceModeActive) {
             setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 150);
           }
@@ -249,7 +256,7 @@ export class VoiceRecognitionService {
 
       recorder.start(100);
     } catch (err: any) {
-      console.error('[VAD] Microphone access error:', err);
+      console.error('[VOICE VAD] Microphone access error:', err);
       this.setVoiceState('error', callbacks);
       if (callbacks.onError) callbacks.onError(err.message || 'Microphone access denied.');
     }
@@ -286,7 +293,7 @@ export class VoiceRecognitionService {
         }
         const average = sum / bufferLength;
 
-        // Phase 1: Adaptive Microphone Calibration (first 10 frames ~150ms)
+        // 1. Calibration (first 10 frames ~150ms)
         if (calibrationFrames < 10) {
           noiseSum += average;
           calibrationFrames++;
@@ -294,23 +301,33 @@ export class VoiceRecognitionService {
             this.noiseFloor = Math.max(5.0, noiseSum / 10.0);
             this.speechThreshold = Math.max(16.0, this.noiseFloor * 3.2);
             this.silenceThreshold = Math.max(8.0, this.speechThreshold * 0.55);
-            console.log(`[VAD CALIBRATION] noise_floor=${this.noiseFloor.toFixed(1)} speech_threshold=${this.speechThreshold.toFixed(1)} silence_threshold=${this.silenceThreshold.toFixed(1)}`);
+            console.log(`[VOICE VAD CALIBRATION] noise_floor=${this.noiseFloor.toFixed(1)} speech_threshold=${this.speechThreshold.toFixed(1)} silence_threshold=${this.silenceThreshold.toFixed(1)}`);
           }
+          return;
+        }
+
+        // 2. Safety Maximum Utterance Duration Check (30 seconds limit)
+        const elapsedSinceStart = Date.now() - this.turnStartTimestamp;
+        if (elapsedSinceStart >= VoiceRecognitionService.SAFETY_MAX_UTTERANCE_MS && this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+          console.log(`[VOICE VAD] turn_finalized reason=safety_max_duration elapsed_ms=${elapsedSinceStart} capture_id='${this.activeCaptureId}'`);
+          this.lastTurnFinalizedTimestamp = Date.now();
+          this.stopMediaRecorder();
           return;
         }
 
         const isSpeakingNow = average > this.speechThreshold;
 
-        // Phase 6: BARGE-IN DETECTION DURING SPEAKING / THINKING / PROCESSING
-        if (isSpeakingNow && (this.currentState === 'speaking' || this.currentState === 'thinking' || this.currentState === 'processing')) {
-          console.log(`[INTERRUPT] BARGE-IN DETECTED state='${this.currentState}' rms=${average.toFixed(1)} > threshold=${this.speechThreshold.toFixed(1)}`);
+        // 3. BARGE-IN DETECTION DURING SPEAKING / THINKING / PROCESSING
+        const timeSinceFinalized = Date.now() - this.lastTurnFinalizedTimestamp;
+        const isOutsideGuardWindow = timeSinceFinalized > VoiceRecognitionService.BARGE_IN_GUARD_MS;
+
+        if (isSpeakingNow && isOutsideGuardWindow && (this.currentState === 'speaking' || ((this.currentState === 'thinking' || this.currentState === 'processing') && timeSinceFinalized > 1000))) {
+          console.log(`[VOICE CANCEL] reason=barge_in state='${this.currentState}' rms=${average.toFixed(1)} > threshold=${this.speechThreshold.toFixed(1)}`);
           
-          // 1. Immediately silence audio and cancel backend turn
           this.stopSpeech();
-          this.cancelActiveTurn();
+          this.cancelActiveTurn('barge_in');
           this.setVoiceState('interrupting', callbacks);
 
-          // 2. Start a fresh listener turn immediately
           if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
             this.stopMediaRecorder();
           }
@@ -320,26 +337,44 @@ export class VoiceRecognitionService {
           return;
         }
 
-        // Standard Turn VAD Logic during LISTENING state
+        // 4. Standard Turn VAD Logic during LISTENING state
         if (isSpeakingNow) {
-          if (!this.hasSpokenInCurrentTurn) {
-            this.hasSpokenInCurrentTurn = true;
-            this.speechStartTimestamp = Date.now();
-            console.log(`[VAD] speech_start_ms=${this.speechStartTimestamp} capture_id='${this.activeCaptureId}'`);
+          this.consecutiveSpeechFrames++;
+          if (this.consecutiveSpeechFrames >= 2) {
+            if (!this.hasSpokenInCurrentTurn) {
+              this.hasSpokenInCurrentTurn = true;
+              this.speechStartTimestamp = Date.now();
+              console.log(`[VOICE VAD] speech_started capture_id='${this.activeCaptureId}' timestamp_ms=${this.speechStartTimestamp}`);
+            } else {
+              const speechElapsed = Date.now() - (this.speechStartTimestamp || this.turnStartTimestamp);
+              if (speechElapsed > 0 && speechElapsed % 3000 < 30) {
+                console.log(`[VOICE VAD] speech_continues elapsed_ms=${speechElapsed} capture_id='${this.activeCaptureId}'`);
+              }
+            }
+            this.silenceStartTimestamp = null;
           }
-          this.silenceStartTimestamp = null;
-        } else if (average < this.silenceThreshold && this.hasSpokenInCurrentTurn) {
-          if (!this.silenceStartTimestamp) {
-            this.silenceStartTimestamp = Date.now();
-          } else if (Date.now() - this.silenceStartTimestamp > 450) {
-            // 450ms silence completes turn
-            console.log(`[VAD] speech_end_ms=${Date.now()} capture_id='${this.activeCaptureId}'`);
-            this.stopMediaRecorder();
+        } else {
+          this.consecutiveSpeechFrames = 0;
+          if (average < this.silenceThreshold && this.hasSpokenInCurrentTurn) {
+            const speechDuration = Date.now() - (this.speechStartTimestamp || this.turnStartTimestamp);
+            if (speechDuration >= VoiceRecognitionService.MIN_SPEECH_DURATION_MS) {
+              if (!this.silenceStartTimestamp) {
+                this.silenceStartTimestamp = Date.now();
+                console.log(`[VOICE VAD] silence_started threshold=${this.silenceThreshold.toFixed(1)} capture_id='${this.activeCaptureId}'`);
+              } else {
+                const silenceDuration = Date.now() - this.silenceStartTimestamp;
+                if (silenceDuration >= VoiceRecognitionService.SILENCE_HANGOVER_MS) {
+                  console.log(`[VOICE VAD] turn_finalized silence_ms=${silenceDuration} speech_duration_ms=${speechDuration} capture_id='${this.activeCaptureId}'`);
+                  this.lastTurnFinalizedTimestamp = Date.now();
+                  this.stopMediaRecorder();
+                }
+              }
+            }
           }
         }
       }, 20);
     } catch (err) {
-      console.warn('[VAD] Audio Context Analyser setup warning:', err);
+      console.warn('[VOICE VAD] Audio Context Analyser setup warning:', err);
     }
   }
 
@@ -363,9 +398,6 @@ export class VoiceRecognitionService {
     }
   }
 
-  /**
-   * Phase 2, 8, 10: Real-Time Streaming Turn Processing with SSE Events
-   */
   private async processAudioTurnStream(
     audioBlob: Blob,
     captureId: string,
@@ -388,7 +420,7 @@ export class VoiceRecognitionService {
         formData.append('conversation_id', activeConversationId);
       }
 
-      console.log(`[STREAM] POST /api/v1/voice/stream capture_id='${captureId}' turn_id='${turnId}' size=${audioBlob.size} bytes...`);
+      console.log(`[VOICE STREAM] POST /api/v1/voice/stream capture_id='${captureId}' turn_id='${turnId}' size=${audioBlob.size} bytes...`);
       const response = await fetch('/api/v1/voice/stream', {
         method: 'POST',
         body: formData,
@@ -416,7 +448,7 @@ export class VoiceRecognitionService {
 
       while (true) {
         if (this.activeTurnId !== turnId) {
-          console.log(`[STREAM] Stale turn reading aborted for turn_id='${turnId}'`);
+          console.log(`[VOICE STREAM] Stale turn reading aborted for turn_id='${turnId}'`);
           reader.cancel();
           break;
         }
@@ -452,22 +484,22 @@ export class VoiceRecognitionService {
                 this.enqueueAudioChunk(turnId, event.audio_b64, event.text, callbacks, activeConversationId);
               }
             } else if (event.type === 'interrupted') {
-              console.log(`[STREAM] Turn interrupted event received for turn_id='${turnId}'`);
+              console.log(`[VOICE STREAM] Turn interrupted event received for turn_id='${turnId}'`);
               break;
             } else if (event.type === 'done') {
-              console.log(`[STREAM] Turn finished total_ms=${event.total_ms || 0}ms turn_id='${turnId}'`);
+              console.log(`[VOICE STREAM] Turn finished total_ms=${event.total_ms || 0}ms turn_id='${turnId}'`);
             }
           } catch (e) {
-            console.warn('[STREAM] Event parse error:', e);
+            console.warn('[VOICE STREAM] Event parse error:', e);
           }
         }
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        console.log(`[STREAM] Fetch aborted for turn_id='${turnId}'`);
+        console.log(`[VOICE STREAM] Fetch aborted for turn_id='${turnId}'`);
         return;
       }
-      console.error('[STREAM] Turn processing error:', err);
+      console.error('[VOICE STREAM] Turn processing error:', err);
       if (this.activeTurnId === turnId) {
         this.setVoiceState('error', callbacks);
         if (callbacks.onError) callbacks.onError(err.message || 'Error processing streaming audio turn.');
@@ -480,9 +512,6 @@ export class VoiceRecognitionService {
     }
   }
 
-  /**
-   * Phase 12: Sequential Audio Queue Management
-   */
   private enqueueAudioChunk(turnId: string, b64Data: string, text: string, callbacks: VoiceCallbacks, activeConversationId?: string | null): void {
     if (turnId !== this.activeTurnId) return;
 
@@ -499,7 +528,7 @@ export class VoiceRecognitionService {
         this.setVoiceState('listening', callbacks);
       }
       if (this.isVoiceModeActive) {
-        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 150);
+        setTimeout(() => this.startTurnListening(callbacks, activeConversationId), 20);
       }
       return;
     }
@@ -552,6 +581,33 @@ export class VoiceRecognitionService {
         resolve();
       }
     });
+  }
+
+  async speakDiagnosticTestText(text: string, callbacks?: VoiceCallbacks): Promise<void> {
+    try {
+      if (callbacks?.onTTSStatus) callbacks.onTTSStatus('Generating TTS test audio...');
+      const response = await fetch('/api/v1/voice/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) throw new Error('TTS test failed.');
+      const blob = await response.blob();
+      const b64 = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const res = reader.result as string;
+          resolve(res.split(',')[1] || '');
+        };
+        reader.readAsDataURL(blob);
+      });
+      if (callbacks?.onStateChange) callbacks.onStateChange('speaking');
+      await this.playAudioBase64(b64, callbacks);
+      if (callbacks?.onStateChange) callbacks.onStateChange('idle');
+    } catch (err: any) {
+      console.warn('[TTS TEST] Speaker test failed:', err);
+      if (callbacks?.onStateChange) callbacks.onStateChange('idle');
+    }
   }
 }
 

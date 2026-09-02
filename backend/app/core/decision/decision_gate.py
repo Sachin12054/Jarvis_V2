@@ -40,6 +40,8 @@ class DecisionGate:
     KNOWLEDGE_QUERY_INTENTS = {
         "KNOWLEDGE_QUERY",
         "GENERAL_CHAT",
+        "CODING_TASK",
+        "DEEP_REASONING",
         "SYSTEM_METRICS",
         "SYSTEM_STATUS",
         "OLLAMA_STATUS",
@@ -53,7 +55,6 @@ class DecisionGate:
     COMPLEX_TASK_INTENTS = {
         "COMPLEX_TASK",
         "MULTI_STEP",
-        "CODING_TASK",
     }
 
     CONFIDENCE_THRESHOLD = 0.60

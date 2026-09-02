@@ -21,3 +21,10 @@ class TaskStep(BaseModel):
     verification: Optional[VerificationResult] = None
     error: Optional[str] = None
     verification_required: bool = True
+    assigned_model: Optional[str] = None
+    shadow_model: Optional[str] = None
+    shadow_confidence: Optional[float] = None
+    start_time: Optional[float] = None
+    completion_time: Optional[float] = None
+    duration_ms: Optional[float] = None
+    output_text: Optional[str] = None

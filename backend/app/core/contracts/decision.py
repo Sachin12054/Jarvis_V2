@@ -10,6 +10,7 @@ class DecisionResult(BaseModel):
     confidence: float = 1.0
     reason: Optional[str] = None
     selected_model: Optional[str] = None
+    fallbacks: list[str] = Field(default_factory=list)
     selected_tool: Optional[str] = None
     requires_confirmation: bool = False
     requires_clarification: bool = False

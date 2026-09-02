@@ -20,6 +20,10 @@ class UnderstandingPipeline:
         "cancel": "STOP",
         "stop speaking": "STOP",
         "shut up": "STOP",
+        "wait": "STOP",
+        "cancel that": "STOP",
+        "never mind": "STOP",
+        "nevermind": "STOP",
         "pause": "PAUSE",
         "freeze": "PAUSE",
         "resume": "RESUME",
@@ -40,6 +44,24 @@ class UnderstandingPipeline:
         "list directory": ("FILESYSTEM_READ", "list_directory"),
         "get location": ("LOCATION", "get_current_location"),
     }
+
+    CODING_PATTERNS = [
+        r'\b(?:write|create|implement|debug|refactor)\b.*\b(?:function|code|script|class|python|javascript|java|c\+\+|rust|html|css|sql|algorithm|fibonacci|quicksort|binary\s+search)\b',
+        r'\b(?:python|javascript|java|c\+\+|coding|code)\s+(?:function|script|code|program)\b',
+        r'\bdef\s+[a-z_][a-z0-9_]*\s*\(',
+        r'\bwrite\s+(?:a\s+)?(?:python|js|c\+\+|java|bash)\b',
+    ]
+
+    REASONING_PATTERNS = [
+        r'\b(?:complex\s+reasoning|logic\s+puzzle|interacting\s+constraints|optimal\s+solution|math\s+proof|step-by-step\s+reasoning|deep\s+reasoning|solve\s+this\s+complex)\b',
+        r'\bsolve\s+this\s+(?:complex|difficult|intricate)\b',
+        r'\bdetermine\s+the\s+optimal\s+solution\b',
+    ]
+
+    ARITHMETIC_PATTERNS = [
+        r'\b(?:what\s+is|calculate|compute|add|subtract|multiply|divide)\b.*\b(?:\d+)\b.*\b(?:\+|\-|\*|\/|plus|minus|multiplied|divided|times|and)\b.*\b(?:\d+)\b',
+        r'^\s*\d+\s*(?:\+|\-|\*|\/|times|plus|minus|divided\s+by|multiplied\s+by)\s*\d+\s*$',
+    ]
 
     @classmethod
     def process(cls, request: JarvisRequest) -> UnderstandingResult:
@@ -105,8 +127,9 @@ class UnderstandingPipeline:
                 ambiguity=False,
             )
 
-        # Step 5: Complex Task Recognition
-        if any(kw in clean_lower for kw in cls.COMPLEX_KEYWORDS):
+        # Step 5: Multi-Clause Complex Task Recognition
+        has_multi_clause = (" and " in clean_lower or ";" in clean_lower) and sum(1 for w in ["explain", "write", "code", "compute", "search", "calculate", "analyze"] if w in clean_lower) >= 2
+        if any(kw in clean_lower for kw in cls.COMPLEX_KEYWORDS) or has_multi_clause:
             return UnderstandingResult(
                 intent="COMPLEX_TASK",
                 entities={"query": text_to_parse},
@@ -115,17 +138,64 @@ class UnderstandingPipeline:
                 ambiguity=False,
             )
 
-        # Step 6: Priority 2 - Math or General Knowledge Query
-        if any(clean_lower.startswith(q) for q in ["what is", "who is", "explain", "tell me about"]):
+        # Step 6: Deep Reasoning Domain Recognition
+        if any(re.search(pat, clean_lower) for pat in cls.REASONING_PATTERNS):
             return UnderstandingResult(
-                intent="KNOWLEDGE_QUERY",
-                entities={"query": text_to_parse},
+                intent="DEEP_REASONING",
+                entities={
+                    "domain": "reasoning",
+                    "requires_reasoning": True,
+                    "complexity": "complex",
+                    "query": text_to_parse,
+                },
                 target_device=request.target_device,
                 confidence=request.confidence,
                 ambiguity=False,
             )
 
-        # Step 7: Priority 3 - Structured Intent Recognition (IntentEngine)
+        # Step 7: Coding Domain Recognition
+        if any(re.search(pat, clean_lower) for pat in cls.CODING_PATTERNS):
+            return UnderstandingResult(
+                intent="CODING_TASK",
+                entities={
+                    "domain": "coding",
+                    "requires_coding": True,
+                    "query": text_to_parse,
+                },
+                target_device=request.target_device,
+                confidence=request.confidence,
+                ambiguity=False,
+            )
+
+        # Step 8: Simple Arithmetic Query Recognition
+        if any(re.search(pat, clean_lower) for pat in cls.ARITHMETIC_PATTERNS):
+            return UnderstandingResult(
+                intent="KNOWLEDGE_QUERY",
+                entities={
+                    "domain": "general_knowledge",
+                    "complexity": "simple",
+                    "query": text_to_parse,
+                },
+                target_device=request.target_device,
+                confidence=request.confidence,
+                ambiguity=False,
+            )
+
+        # Step 9: General Knowledge Query Recognition
+        if any(clean_lower.startswith(q) for q in ["what is", "who is", "explain", "tell me about"]):
+            return UnderstandingResult(
+                intent="KNOWLEDGE_QUERY",
+                entities={
+                    "domain": "general_knowledge",
+                    "complexity": "normal",
+                    "query": text_to_parse,
+                },
+                target_device=request.target_device,
+                confidence=request.confidence,
+                ambiguity=False,
+            )
+
+        # Step 10: Fallback to Structured Intent Recognition (IntentEngine)
         try:
             intent_plan: IntentPlan = IntentEngine.analyze(text_to_parse, channel=request.input_channel.value)
             if intent_plan and intent_plan.intents:
@@ -138,7 +208,7 @@ class UnderstandingPipeline:
 
         return UnderstandingResult(
             intent="GENERAL_CHAT",
-            entities={"query": text_to_parse},
+            entities={"domain": "general_knowledge", "query": text_to_parse},
             target_device=request.target_device,
             confidence=request.confidence,
             ambiguity=False,

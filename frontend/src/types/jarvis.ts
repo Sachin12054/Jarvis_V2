@@ -6,6 +6,7 @@ export interface ChatMessage {
   content: string;
   model?: string;
   timestamp: string;
+  subtasks?: any[];
 }
 
 export interface SystemMetrics {

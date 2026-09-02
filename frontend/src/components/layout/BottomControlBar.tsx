@@ -3,7 +3,7 @@ import { Mic, Send, Square, Volume2, AlertCircle, Hand } from 'lucide-react';
 import { useJarvisStore } from '../../state/jarvisStore';
 import { useJarvisStream } from '../../hooks/useJarvisStream';
 import { VoiceRecognitionService } from '../../services/voiceService';
-import { ChatMessage } from '../../types/jarvis';
+import { ChatMessage, JarvisState } from '../../types/jarvis';
 
 export const BottomControlBar: React.FC = () => {
   const [inputText, setInputText] = useState('');
@@ -68,12 +68,12 @@ export const BottomControlBar: React.FC = () => {
     setIsTestingSpeaker(true);
     setTtsNotice('Testing speaker playback...');
     await voiceServiceRef.current.speakDiagnosticTestText("Hello. This is JARVIS audio test.", {
-      onStateChange: (state) => {
+      onStateChange: (state: JarvisState) => {
         setJarvisState(state);
         setIsSpeaking(state === 'speaking');
         if (state === 'idle') setIsTestingSpeaker(false);
       },
-      onTTSStatus: (status) => setTtsNotice(status),
+      onTTSStatus: (status: string) => setTtsNotice(status),
     });
     setIsTestingSpeaker(false);
   };

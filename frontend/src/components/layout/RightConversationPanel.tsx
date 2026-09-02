@@ -4,6 +4,7 @@ import { useJarvisStore } from '../../state/jarvisStore';
 import { MarkdownContent } from '../chat/MarkdownContent';
 import { formatModelDisplayName } from '../../utils/modelNames';
 import { BottomControlBar } from './BottomControlBar';
+import { TaskGraphVisualizer } from '../jarvis/TaskGraphVisualizer';
 
 export const RightConversationPanel: React.FC = () => {
   const { messages, isGenerating } = useJarvisStore();
@@ -86,6 +87,9 @@ export const RightConversationPanel: React.FC = () => {
                 </div>
 
                 <div className="text-gray-100 font-sans leading-relaxed">
+                  {msg.subtasks && msg.subtasks.length > 0 && (
+                    <TaskGraphVisualizer subtasks={msg.subtasks} />
+                  )}
                   <MarkdownContent content={msg.content} />
                   {!isUser && isLast && isGenerating && (
                     <span className="inline-block w-2 h-4 bg-[#00f0ff] ml-1 animate-pulse align-middle" />

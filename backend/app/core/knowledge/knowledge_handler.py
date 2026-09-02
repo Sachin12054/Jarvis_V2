@@ -1,5 +1,6 @@
 import asyncio
 from typing import Optional, Dict, Any, List, Protocol
+from app.core.logging import logger
 from app.core.contracts import (
     JarvisRequest,
     UnderstandingResult,
@@ -23,8 +24,8 @@ class LLMProviderPort(Protocol):
 class KnowledgeHandler:
     """Core Knowledge Execution Handler.
 
-    Coordinates knowledge queries through an abstract LLMProviderPort boundary.
-    Contains zero direct infrastructure dependencies (no Ollama, FastAPI, CUA Driver).
+    Coordinates knowledge queries through an abstract LLMProviderPort boundary
+    with support for fallback model execution.
     """
 
     def __init__(self, llm_provider: Optional[LLMProviderPort] = None):
@@ -47,7 +48,7 @@ class KnowledgeHandler:
         decision: DecisionResult,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> JarvisResponse:
-        """Executes a KNOWLEDGE_QUERY request and returns a canonical JarvisResponse."""
+        """Executes a KNOWLEDGE_QUERY request with fallback model retries."""
         if cancel_event and cancel_event.is_set():
             return JarvisResponse(
                 request_id=request.request_id,
@@ -74,43 +75,71 @@ class KnowledgeHandler:
         )
 
         messages = [
-            {"role": "system", "content": "You are JARVIS, a helpful AI assistant. Be concise, precise, and direct."},
+            {"role": "system", "content": "You are JARVIS, a helpful AI assistant. Be concise, precise, and direct. Do NOT output internal chain-of-thought or thinking text."},
             {"role": "user", "content": query_text},
         ]
 
-        target_model = decision.selected_model or "qwen3-test:latest"
+        # Determine target model and fallback candidates
+        primary_model = decision.selected_model or "qwen3-test:latest"
+        models_to_try = [primary_model]
+        if getattr(decision, "fallbacks", None):
+            for fb in decision.fallbacks:
+                if fb not in models_to_try:
+                    models_to_try.append(fb)
 
-        try:
-            response_text = await self.provider.generate_response(
-                messages=messages,
-                model=target_model,
-            )
+        # Enforce maximum fallback attempt limit (Max 2 retries = 3 total attempts)
+        models_to_try = models_to_try[:3]
 
-            if cancel_event and cancel_event.is_set():
-                return JarvisResponse(
-                    request_id=request.request_id,
-                    turn_id=request.turn_id,
-                    message="Knowledge query cancelled during generation.",
-                    response_type=ResponseType.TEXT,
-                    should_speak=False,
-                    metadata={"cancelled": True},
+        last_error = None
+        response_text = ""
+        used_model = primary_model
+        fallback_used = False
+
+        for idx, target_model in enumerate(models_to_try):
+            try:
+                response_text = await self.provider.generate_response(
+                    messages=messages,
+                    model=target_model,
+                )
+                used_model = target_model
+                if idx > 0:
+                    fallback_used = True
+                    logger.info(f"[KnowledgeHandler Fallback Success] Successfully completed query using fallback '{target_model}'")
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    f"[KnowledgeHandler Fallback Attempt] Model '{target_model}' failed ({type(exc).__name__}: {exc}). "
+                    f"Attempts left: {len(models_to_try) - idx - 1}"
                 )
 
+        if last_error is not None:
             return JarvisResponse(
                 request_id=request.request_id,
                 turn_id=request.turn_id,
-                message=response_text,
-                response_type=ResponseType.TEXT,
-                should_speak=request.input_channel.value == "voice",
-                should_display=True,
-                metadata={"model": target_model, "query": query_text},
-            )
-        except Exception as exc:
-            return JarvisResponse(
-                request_id=request.request_id,
-                turn_id=request.turn_id,
-                message=f"Failed to generate knowledge response: {str(exc)}",
+                message=f"Failed to generate knowledge response: {str(last_error)}",
                 response_type=ResponseType.ERROR,
-                error=str(exc),
-                metadata={"model": target_model},
+                error=str(last_error),
+                metadata={"model": primary_model, "attempted_models": models_to_try},
             )
+
+        if cancel_event and cancel_event.is_set():
+            return JarvisResponse(
+                request_id=request.request_id,
+                turn_id=request.turn_id,
+                message="Knowledge query cancelled during generation.",
+                response_type=ResponseType.TEXT,
+                should_speak=False,
+                metadata={"cancelled": True},
+            )
+
+        return JarvisResponse(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            message=response_text,
+            response_type=ResponseType.TEXT,
+            should_speak=request.input_channel.value == "voice",
+            should_display=True,
+            metadata={"model": used_model, "query": query_text, "fallback_used": fallback_used},
+        )

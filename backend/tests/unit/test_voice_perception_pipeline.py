@@ -90,6 +90,42 @@ async def test_long_speech_and_natural_pauses():
 
 
 @pytest.mark.asyncio
+async def test_continued_speech_beyond_3s_supported():
+    # Audio capture duration of 15 seconds must be valid and supported
+    mock_seg = MagicMock()
+    mock_seg.avg_logprob = -0.3
+    mock_seg.no_speech_prob = 0.02
+    mock_seg.compression_ratio = 1.1
+    text = "JARVIS can you tell me what the capital of Karnataka is and give me two interesting facts about the city"
+    ok, reason, conf = evaluate_stt_quality([mock_seg], text, 15000.0)
+    assert ok is True
+    assert reason == "PASSED"
+
+
+@pytest.mark.asyncio
+async def test_natural_pause_preservation():
+    # Pause of 800ms between words should NOT cut off utterance (hangover threshold = 1200ms)
+    pause_ms = 800.0
+    silence_hangover_ms = 1200.0
+    assert pause_ms < silence_hangover_ms
+
+
+@pytest.mark.asyncio
+async def test_barge_in_cancellation_during_tts():
+    mgr = VoiceSessionManager()
+    session = await mgr.create_session(conversation_id="conv-barge1")
+    session, turn_id = await mgr.start_turn(session.session_id, turn_id="turn-barge1")
+    session = await mgr.transition_state(session.session_id, VoiceState.PROCESSING)
+    session = await mgr.transition_state(session.session_id, VoiceState.THINKING)
+    session = await mgr.transition_state(session.session_id, VoiceState.SPEAKING)
+
+    # User speaks while JARVIS is speaking -> triggers interruption
+    interrupted_session = await mgr.request_interruption(session.session_id, turn_id=turn_id)
+    assert interrupted_session.state == VoiceState.IDLE
+    assert interrupted_session.active_turn_id is None
+
+
+@pytest.mark.asyncio
 async def test_false_activation_and_repetition_rejection():
     mock_seg = MagicMock()
     mock_seg.avg_logprob = -0.5

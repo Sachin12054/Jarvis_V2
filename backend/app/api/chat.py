@@ -39,11 +39,17 @@ async def _generate_sse_stream(
         ):
             last_conv_id = data["conversation_id"]
             last_model = data["model"]
-            payload = json.dumps({
+            payload_dict = {
                 "conversation_id": last_conv_id,
                 "chunk": data["chunk"],
                 "model": last_model,
-            })
+            }
+            if "task_event" in data:
+                payload_dict["task_event"] = data["task_event"]
+            if "task_telemetry" in data:
+                payload_dict["task_telemetry"] = data["task_telemetry"]
+
+            payload = json.dumps(payload_dict)
             yield f"data: {payload}\n\n"
 
         done_payload = json.dumps({

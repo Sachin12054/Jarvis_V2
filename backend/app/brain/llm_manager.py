@@ -245,13 +245,15 @@ class OllamaLLMProvider(LLMProvider):
 
         await self.check_ollama_health(selected_model)
 
+        options_dict = {"num_ctx": num_ctx}
+        if "deepseek-r1" not in selected_model.lower():
+            options_dict["think"] = False
+
         payload = {
             "model": selected_model,
             "messages": messages,
             "stream": True,
-            "options": {
-                "num_ctx": num_ctx
-            },
+            "options": options_dict,
             "keep_alive": "15m",
         }
 
@@ -299,7 +301,7 @@ class OllamaLLMProvider(LLMProvider):
                                 continue
 
                             msg_data = data.get("message", {})
-                            chunk = msg_data.get("content") or data.get("thinking") or msg_data.get("thinking") or ""
+                            chunk = msg_data.get("content") or ""
                             eval_count = data.get("eval_count") or eval_count
 
                             if chunk:
@@ -349,13 +351,15 @@ class OllamaLLMProvider(LLMProvider):
 
         await self.check_ollama_health(selected_model)
 
+        options_dict = {"num_ctx": num_ctx}
+        if "deepseek-r1" not in selected_model.lower():
+            options_dict["think"] = False
+
         payload = {
             "model": selected_model,
             "messages": messages,
             "stream": True,
-            "options": {
-                "num_ctx": num_ctx
-            },
+            "options": options_dict,
             "keep_alive": "15m",
         }
 
@@ -409,7 +413,7 @@ class OllamaLLMProvider(LLMProvider):
                                 continue
 
                             msg_data = data.get("message", {})
-                            chunk = msg_data.get("content") or data.get("thinking") or msg_data.get("thinking") or ""
+                            chunk = msg_data.get("content") or ""
 
                             if chunk:
                                 if not first_chunk_logged:

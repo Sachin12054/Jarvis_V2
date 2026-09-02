@@ -125,8 +125,33 @@ class ChatService:
         input_channel = InputChannel.VOICE if channel == "voice" else InputChannel.TEXT
         jarvis_req = RequestAdapter.from_chat_request(chat_req, channel=input_channel)
 
-        # 3. Process request through canonical JarvisCoreOrchestrator
-        jarvis_resp = await self.core_orchestrator.process_request(jarvis_req, cancel_event=cancel_event)
+        event_queue = asyncio.Queue()
+
+        async def _on_task_event(evt: Dict[str, Any]) -> None:
+            await event_queue.put(evt)
+
+        # Launch orchestrator in background task to stream events asynchronously as they occur
+        orch_task = asyncio.create_task(
+            self.core_orchestrator.process_request(
+                jarvis_req,
+                cancel_event=cancel_event,
+                event_callback=_on_task_event,
+            )
+        )
+
+        while not orch_task.done() or not event_queue.empty():
+            try:
+                evt = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                yield {
+                    "conversation_id": conversation.id,
+                    "chunk": "",
+                    "model": evt.get("assigned_model") or "jarvis-orchestrator",
+                    "task_event": evt,
+                }
+            except asyncio.TimeoutError:
+                continue
+
+        jarvis_resp = await orch_task
 
         # 4. Convert canonical JarvisResponse to API ChatResponse using ResponseAdapter
         chat_resp = ResponseAdapter.to_chat_response(jarvis_resp)
@@ -138,11 +163,17 @@ class ChatService:
             conversation_id=conversation.id,
             role="assistant",
             content=chat_resp.message,
-            extra_metadata={"model": chat_resp.model, "channel": channel, "response_type": jarvis_resp.response_type.value},
+            extra_metadata={
+                "model": chat_resp.model,
+                "channel": channel,
+                "response_type": jarvis_resp.response_type.value,
+                "subtasks": jarvis_resp.metadata.get("subtasks"),
+            },
         )
 
         yield {
             "conversation_id": conversation.id,
             "chunk": chat_resp.message,
             "model": chat_resp.model,
+            "task_telemetry": jarvis_resp.metadata.get("subtasks"),
         }

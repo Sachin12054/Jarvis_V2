@@ -20,14 +20,19 @@ from app.core.execution import DirectActionExecutor
 from app.core.knowledge import KnowledgeHandler
 from app.core.tools import ToolHandler
 from app.core.brain import TaskPlanner, TaskExecutionCoordinator
+from app.core.brain.task_aggregator import TaskAggregator
 from app.core.interaction import ClarificationManager
+from app.core.model_router import (
+    CanonicalModelRouter,
+    ModelSelectionContextBuilder,
+)
 
 
 class JarvisCoreOrchestrator:
     """Unified Core Orchestrator for JARVIS V2.
 
     Coordinates the canonical pipeline:
-    JarvisRequest to UnderstandingPipeline to DecisionGate to Handlers/TaskBrain/Clarification to JarvisResponse
+    JarvisRequest -> UnderstandingPipeline -> DecisionGate -> ModelRouter -> Handlers/TaskBrain/Clarification -> JarvisResponse
 
     Contains zero direct infrastructure dependencies (no Ollama, Whisper, Kokoro, FastAPI, CUA Driver).
     """
@@ -40,6 +45,7 @@ class JarvisCoreOrchestrator:
         task_coordinator: Optional[TaskExecutionCoordinator] = None,
         clarification_manager: Optional[ClarificationManager] = None,
         planner: Optional[TaskPlanner] = None,
+        model_router: Optional[CanonicalModelRouter] = None,
     ):
         self._executor = executor or DirectActionExecutor()
         self._knowledge_handler = knowledge_handler or KnowledgeHandler()
@@ -47,11 +53,14 @@ class JarvisCoreOrchestrator:
         self._planner = planner or TaskPlanner()
         self._task_coordinator = task_coordinator or TaskExecutionCoordinator(planner=self._planner)
         self._clarification_manager = clarification_manager or ClarificationManager(planner=self._planner)
+        self._model_router = model_router or CanonicalModelRouter()
 
     async def process_request(
         self,
         request: JarvisRequest,
         cancel_event: Optional[asyncio.Event] = None,
+        event_callback: Optional[Any] = None,
+        **kwargs,
     ) -> JarvisResponse:
         """Processes a canonical JarvisRequest through the core architecture pipeline."""
 
@@ -100,7 +109,7 @@ class JarvisCoreOrchestrator:
         # 2. Decision Gate
         decision: DecisionResult = DecisionGate.evaluate(request, understanding)
 
-        # 3. Handle DIRECT_ACTION Strategy
+        # 3. Handle DIRECT_ACTION Strategy (Fast-path: bypasses ModelRouter completely)
         if decision.strategy == DecisionStrategy.DIRECT_ACTION:
             context: Dict[str, Any] = {
                 "request_id": request.request_id,
@@ -131,7 +140,31 @@ class JarvisCoreOrchestrator:
                 error=exec_res.error_message if not exec_res.success else None,
             )
 
-        # 4. Handle KNOWLEDGE_QUERY Strategy
+        # 4. Canonical Model Routing for Cognitive Workload Strategies
+        if decision.strategy in (
+            DecisionStrategy.KNOWLEDGE_QUERY,
+            DecisionStrategy.TOOL_CALL,
+            DecisionStrategy.COMPLEX_TASK,
+        ):
+            sel_ctx = ModelSelectionContextBuilder.build(request, understanding, decision)
+            route = self._model_router.route(sel_ctx)
+
+            if not route.is_satisfied:
+                return JarvisResponse(
+                    request_id=request.request_id,
+                    turn_id=request.turn_id,
+                    message=f"Model routing failure: {route.reason}",
+                    response_type=ResponseType.ERROR,
+                    error=route.reason,
+                    should_speak=request.input_channel.value == "voice",
+                    should_display=True,
+                    metadata={"strategy": decision.strategy.value, "conversation_id": request.conversation_id},
+                )
+
+            decision.selected_model = route.selected_model
+            decision.fallbacks = route.fallbacks
+
+        # 5. Handle KNOWLEDGE_QUERY Strategy
         if decision.strategy == DecisionStrategy.KNOWLEDGE_QUERY:
             resp = await self._knowledge_handler.handle_knowledge_query(
                 request=request,
@@ -142,7 +175,7 @@ class JarvisCoreOrchestrator:
             resp.metadata["conversation_id"] = request.conversation_id
             return resp
 
-        # 5. Handle TOOL_CALL Strategy
+        # 6. Handle TOOL_CALL Strategy
         if decision.strategy == DecisionStrategy.TOOL_CALL:
             resp = await self._tool_handler.handle_tool_call(
                 request=request,
@@ -152,7 +185,7 @@ class JarvisCoreOrchestrator:
             resp.metadata["conversation_id"] = request.conversation_id
             return resp
 
-        # 6. Handle CLARIFICATION Strategy
+        # 7. Handle CLARIFICATION Strategy
         if decision.strategy == DecisionStrategy.CLARIFICATION:
             missing_info = understanding.entities.get("missing_information", "target") if understanding.entities else "target"
             options = understanding.entities.get("options", []) if understanding.entities else []
@@ -177,7 +210,7 @@ class JarvisCoreOrchestrator:
                 metadata={"strategy": decision.strategy.value, "decision_id": decision.decision_id, "clarification_id": ctx.clarification_id, "conversation_id": request.conversation_id},
             )
 
-        # 7. Handle CANCEL Strategy
+        # 8. Handle CANCEL Strategy
         if decision.strategy == DecisionStrategy.CANCEL:
             return JarvisResponse(
                 request_id=request.request_id,
@@ -189,22 +222,49 @@ class JarvisCoreOrchestrator:
                 metadata={"strategy": decision.strategy.value, "decision_id": decision.decision_id, "conversation_id": request.conversation_id},
             )
 
-        # 8. Handle COMPLEX_TASK Strategy
+        # 9. Handle COMPLEX_TASK Strategy
         if decision.strategy == DecisionStrategy.COMPLEX_TASK:
-            task = self._planner.create_task(request)
-            capability = understanding.entities.get("capability") or request.raw_input
-            step = TaskStep(
-                task_id=task.task_id,
-                description=request.raw_input,
-                capability=capability,
-                arguments=understanding.entities,
-            )
-            self._planner.plan_task(task, steps=[step])
+            subtasks = understanding.entities.get("subtasks") if understanding.entities else None
+            task = self._planner.decompose_complex_request(request, custom_subtasks=subtasks)
 
-            executed_task = await self._task_coordinator.execute_task(task, cancel_event=cancel_event)
+            async def _subtask_model_executor(step: TaskStep, ctx: Dict[str, Any]) -> str:
+                # Execute subtask using per-subtask assigned model from BaselineAdaptivePolicy
+                sub_req = JarvisRequest(
+                    conversation_id=request.conversation_id,
+                    request_id=request.request_id,
+                    turn_id=request.turn_id,
+                    raw_input=step.description,
+                    input_channel=request.input_channel,
+                )
+                sub_und = UnderstandingResult(
+                    intent="KNOWLEDGE_QUERY" if "code" not in step.capability.lower() else "CODING_TASK",
+                    confidence=1.0,
+                    entities={"prompt": step.description},
+                )
+                sub_dec = DecisionResult(
+                    decision_id=f"dec_{step.step_id}",
+                    strategy=DecisionStrategy.KNOWLEDGE_QUERY,
+                    selected_model=step.assigned_model or "qwen3-test:latest",
+                    reason=f"Subtask execution via {step.assigned_model}",
+                )
+
+                resp = await self._knowledge_handler.handle_knowledge_query(
+                    request=sub_req,
+                    understanding=sub_und,
+                    decision=sub_dec,
+                    cancel_event=cancel_event,
+                )
+                return resp.message
+
+            executed_task = await self._task_coordinator.execute_task_dag(
+                task,
+                cancel_event=cancel_event,
+                event_callback=kwargs.get("event_callback"),
+                step_executor=_subtask_model_executor,
+            )
             return self._build_task_response(request, executed_task)
 
-        # 9. Handle NO_OP / Default Strategy
+        # 10. Handle NO_OP / Default Strategy
         return JarvisResponse(
             request_id=request.request_id,
             turn_id=request.turn_id,
@@ -248,17 +308,38 @@ class JarvisCoreOrchestrator:
             last_step = task.steps[-1] if task.steps else None
             exec_res = last_step.result if last_step else None
             ver_res = last_step.verification if last_step else None
+            synth_message = TaskAggregator().aggregate_results(task)
+
+            subtask_telemetry = [
+                {
+                    "step_id": s.step_id,
+                    "description": s.description,
+                    "assigned_model": s.assigned_model,
+                    "shadow_model": s.shadow_model,
+                    "shadow_confidence": s.shadow_confidence,
+                    "start_time": s.start_time,
+                    "completion_time": s.completion_time,
+                    "duration_ms": s.duration_ms,
+                    "state": s.state.value,
+                }
+                for s in task.steps
+            ]
 
             return JarvisResponse(
                 request_id=request.request_id,
                 turn_id=request.turn_id,
-                message="Task completed successfully.",
+                message=synth_message,
                 response_type=ResponseType.ACTION,
                 execution_result=exec_res,
                 verification_result=ver_res,
                 should_speak=request.input_channel.value == "voice",
                 should_display=True,
-                metadata={"task_id": task.task_id, "state": task.state.value, "conversation_id": request.conversation_id},
+                metadata={
+                    "task_id": task.task_id,
+                    "state": task.state.value,
+                    "conversation_id": request.conversation_id,
+                    "subtasks": subtask_telemetry,
+                },
             )
 
         err_msg = task.metadata.get("error") or f"Task execution finished in state {task.state.value}."

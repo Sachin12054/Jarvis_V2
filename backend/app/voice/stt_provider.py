@@ -43,28 +43,47 @@ except Exception as fw_err:
     FASTER_WHISPER_IMPORT_ERROR = str(fw_err)
 
 
+def setup_cuda_dll_directories() -> None:
+    """Adds nvidia-cublas-cu12 and nvidia-cudnn-cu12 DLL directories to Windows DLL search path."""
+    if sys.platform != "win32":
+        return
+    try:
+        import site
+        site_packages = site.getsitepackages()
+        user_site = site.getusersitepackages()
+        if user_site and isinstance(user_site, str):
+            site_packages.append(user_site)
+
+        for sp in site_packages:
+            if not os.path.exists(sp):
+                continue
+            nvidia_dir = os.path.join(sp, "nvidia")
+            if os.path.isdir(nvidia_dir):
+                for root, dirs, files in os.walk(nvidia_dir):
+                    if any(f.lower().endswith(".dll") for f in files):
+                        try:
+                            os.add_dll_directory(root)
+                            if root not in os.environ.get("PATH", ""):
+                                os.environ["PATH"] = root + os.path.pathsep + os.environ.get("PATH", "")
+                            logger.info(f"[STT CUDA SETUP] Added NVIDIA DLL directory to search path: {root}")
+                        except Exception as e:
+                            logger.debug(f"[STT CUDA SETUP] add_dll_directory error for {root}: {e}")
+    except Exception as exc:
+        logger.debug(f"[STT CUDA SETUP] Error locating nvidia DLL directories: {exc}")
+
+
+setup_cuda_dll_directories()
+
+
 def check_cuda_available() -> bool:
-    """Checks if CUDA GPU device is available and required cuBLAS DLLs are present on Windows."""
+    """Checks if CUDA GPU device is available for CTranslate2."""
     if not CTRANSLATE2_AVAILABLE:
         return False
     try:
-        # Check for cublas64_12.dll / cublas64_11.dll DLL availability
-        has_cublas = False
-        if shutil.which("cublas64_12.dll") or shutil.which("cublas64_11.dll"):
-            has_cublas = True
-        else:
-            cuda_path = os.environ.get("CUDA_PATH", "")
-            if cuda_path and (os.path.exists(os.path.join(cuda_path, "bin", "cublas64_12.dll")) or os.path.exists(os.path.join(cuda_path, "bin", "cublas64_11.dll"))):
-                has_cublas = True
-
-        if not has_cublas:
-            logger.info("[STT DEVICE DIAGNOSTICS] cuBLAS DLLs (cublas64_12.dll) not found in system PATH. Selecting CPU for Faster-Whisper.")
-            return False
-
         if hasattr(ctranslate2, "get_cuda_device_count"):
             return ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[STT DEVICE DIAGNOSTICS] CUDA check error: {exc}")
     return False
 
 

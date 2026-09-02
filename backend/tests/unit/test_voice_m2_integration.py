@@ -36,7 +36,9 @@ async def test_end_to_end_voice_to_knowledge_query_path():
     session = await session_mgr.create_session(conversation_id="conv-kn-1")
     session, turn_id = await session_mgr.start_turn(session.session_id)
     req = JarvisRequest(raw_input="what is machine learning", input_text="what is machine learning", conversation_id=session.conversation_id, turn_id=turn_id, channel="voice")
-    core = JarvisCoreOrchestrator()
+    from app.brain.llm_manager import MockLLMProvider
+    from app.core.knowledge.knowledge_handler import KnowledgeHandler
+    core = JarvisCoreOrchestrator(knowledge_handler=KnowledgeHandler(llm_provider=MockLLMProvider()))
     res = await core.process_request(req)
     assert res.error is None
     assert len(res.message) > 0
